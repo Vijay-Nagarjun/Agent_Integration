@@ -355,6 +355,97 @@ This is a folder for organizing content.
             logger.error(f"Error deleting note: {str(e)}")
             raise Exception(f"Network error: {str(e)}")
 
+    def update_folder(self, folder_id: str, name: str, description: str = "") -> Dict:
+        """Update an existing folder in Slite"""
+        try:
+            endpoint = f"{self.base_url}/v1/notes/{folder_id}"
+            
+            # Update folder using note with special format
+            markdown_content = f"""# {name}
+
+{description}
+
+---
+This is a folder for organizing content.
+"""
+            
+            data = {
+                "title": name,
+                "markdown": markdown_content,
+                "isFolder": True
+            }
+            
+            response = requests.put(
+                endpoint,
+                headers=self.headers,
+                json=data
+            )
+            
+            if response.status_code in [200, 201]:
+                result = response.json()
+                return {
+                    "id": result.get("id"),
+                    "name": name,
+                    "description": description,
+                    "url": result.get("url")
+                }
+            else:
+                logger.error(f"Error updating folder: {response.text}")
+                response.raise_for_status()
+                
+        except Exception as e:
+            logger.error(f"Error updating folder: {str(e)}")
+            raise
+
+    def delete_folder(self, folder_id: str) -> Dict:
+        """Delete a folder from Slite"""
+        try:
+            endpoint = f"{self.base_url}/v1/notes/{folder_id}"
+            response = requests.delete(endpoint, headers=self.headers)
+            
+            if response.status_code == 204:
+                return {"status": "success", "message": f"Folder {folder_id} deleted successfully"}
+            elif response.status_code == 429:
+                raise Exception("Rate limit exceeded")
+            elif response.status_code == 401:
+                raise Exception("Invalid API key")
+            elif response.status_code == 404:
+                raise Exception(f"Folder {folder_id} not found")
+            else:
+                raise Exception(f"Error deleting folder: {response.text}")
+                
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Error deleting folder: {str(e)}")
+            raise Exception(f"Network error: {str(e)}")
+
+    def update_document(self, doc_id: str, title: str, markdown_content: str, folder_id: Optional[str] = None) -> Dict:
+        """Update an existing document in Slite"""
+        try:
+            endpoint = f"{self.base_url}/v1/notes/{doc_id}"
+            data = {
+                "title": title,
+                "markdown": markdown_content
+            }
+            
+            if folder_id:
+                data["parentNoteId"] = folder_id
+            
+            response = requests.put(
+                endpoint,
+                headers=self.headers,
+                json=data
+            )
+            
+            if response.status_code in [200, 201]:
+                return response.json()
+            else:
+                logger.error(f"Error updating document: {response.text}")
+                response.raise_for_status()
+                
+        except Exception as e:
+            logger.error(f"Error updating document: {str(e)}")
+            raise
+
 if __name__ == "__main__":
     # Test the API connection
     slite = SliteAPI("your_api_key")
