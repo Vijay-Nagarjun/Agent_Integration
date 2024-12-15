@@ -6,6 +6,7 @@ import json
 from datetime import datetime
 import os
 from cachetools import TTLCache
+import random
 
 # Configure logging
 def setup_logging(log_file: str = 'slite_integration.log'):
@@ -48,77 +49,61 @@ class RateLimiter:
 
 rate_limiter = RateLimiter()
 
-def retry_with_backoff(retries: int = 3, backoff_factor: float = 0.5):
-    def decorator(func: Callable) -> Callable:
+def retry_with_backoff(retries: int = 3, backoff_in_seconds: int = 1):
+    """Retry decorator with exponential backoff"""
+    def decorator(func: Callable):
         @wraps(func)
-        def wrapper(*args, **kwargs) -> Any:
-            retry_count = 0
-            while retry_count < retries:
+        def wrapper(*args, **kwargs):
+            x = 0
+            while True:
                 try:
                     rate_limiter.wait_for_next_slot()
                     return func(*args, **kwargs)
                 except Exception as e:
-                    retry_count += 1
-                    if retry_count == retries:
+                    if x == retries:
                         logger.error(f"Failed after {retries} retries: {str(e)}")
                         raise
-                    wait_time = backoff_factor * (2 ** (retry_count - 1))
-                    logger.warning(f"Attempt {retry_count} failed: {str(e)}. Retrying in {wait_time} seconds...")
-                    time.sleep(wait_time)
-            return None
+                    else:
+                        wait = (backoff_in_seconds * 2 ** x + 
+                               random.uniform(0, 1))
+                        logger.warning(f"Attempt {x+1} failed: {str(e)}. "
+                                     f"Retrying in {wait:.1f} seconds...")
+                        time.sleep(wait)
+                        x += 1
         return wrapper
     return decorator
 
 class Cache:
-    def __init__(self, cache_file: str = 'cache.json'):
+    """Simple file-based cache"""
+    def __init__(self, cache_file: str):
         self.cache_file = cache_file
-        self.cache = self._load_cache()
+        self._cache = self._load_cache()
 
-    def _load_cache(self) -> Dict:
-        if os.path.exists(self.cache_file):
-            try:
-                with open(self.cache_file, 'r') as f:
-                    cache_data = json.load(f)
-                # Clean expired entries
-                current_time = datetime.now().timestamp()
-                cache_data = {
-                    k: v for k, v in cache_data.items()
-                    if current_time - v.get('timestamp', 0) < v.get('ttl', 300)
-                }
-                return cache_data
-            except Exception as e:
-                logger.error(f"Error loading cache: {str(e)}")
-                return {}
-        return {}
+    def _load_cache(self) -> dict:
+        """Load cache from file"""
+        try:
+            with open(self.cache_file, 'r') as f:
+                return json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            return {}
 
     def _save_cache(self):
-        try:
-            with open(self.cache_file, 'w') as f:
-                json.dump(self.cache, f)
-        except Exception as e:
-            logger.error(f"Error saving cache: {str(e)}")
+        """Save cache to file"""
+        with open(self.cache_file, 'w') as f:
+            json.dump(self._cache, f)
 
-    def get(self, key: str) -> Optional[Any]:
-        if key in self.cache:
-            entry = self.cache[key]
-            if datetime.now().timestamp() - entry['timestamp'] < entry['ttl']:
-                logger.debug(f"Cache hit for key: {key}")
-                return entry['data']
-            else:
-                del self.cache[key]
-                self._save_cache()
-        return None
+    def get(self, key: str) -> Optional[str]:
+        """Get value from cache"""
+        return self._cache.get(key)
 
-    def set(self, key: str, value: Any, ttl: int = 300):
-        self.cache[key] = {
-            'data': value,
-            'timestamp': datetime.now().timestamp(),
-            'ttl': ttl
-        }
+    def set(self, key: str, value: str):
+        """Set value in cache"""
+        self._cache[key] = value
         self._save_cache()
 
     def clear(self):
-        self.cache = {}
+        """Clear the cache"""
+        self._cache = {}
         self._save_cache()
 
 class APIError(Exception):

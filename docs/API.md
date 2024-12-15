@@ -134,7 +134,47 @@ class ValidationError(APIError):
 
 ### Example Error Handling
 
-```python
+```pythonimport logging
+from typing import Dict, Optional
+from datetime import datetime
+from models import MeetingNote, FolderStructure
+from slite_api import SliteAPI
+from exceptions import APIError
+
+logger = logging.getLogger(__name__)
+
+class NoteManager:
+    def __init__(self, api_key: str):
+        self.api = SliteAPI(api_key=api_key)
+
+    def create_note(self, title: str, content: str) -> Dict:
+        """Create a new note"""
+        try:
+            # Create note with content in a single call
+            note = MeetingNote(
+                title=title,
+                content=content,
+                created_at=datetime.now().isoformat()
+            )
+            
+            logger.info(f"Creating note with title: {title}")
+            return self.api.create_note(note)
+            
+        except Exception as e:
+            logger.error(f"Error creating note: {str(e)}")
+            raise
+
+    def create_folder(self, name: str, description: Optional[str] = None) -> Dict:
+        """Create a new folder"""
+        try:
+            folder = FolderStructure(
+                name=name,
+                description=description
+            )
+            return self.api.create_folder(folder)
+        except Exception as e:
+            logger.error(f"Error creating folder: {str(e)}")
+            raise
 try:
     result = manager.process_meeting_notes(notes)
 except ValidationError as e:

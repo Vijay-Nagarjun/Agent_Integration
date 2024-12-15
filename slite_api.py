@@ -1,368 +1,367 @@
-import os
 import requests
-from dotenv import load_dotenv
-from datetime import datetime
-from models import MeetingNote, FolderStructure, NoteResponse, FolderResponse
-from typing import Optional, List, Dict
-import json
-from utils import (
-    logger, retry_with_backoff, Cache, APIError, RateLimitError,
-    AuthenticationError, NotFoundError, ValidationError
-)
+import logging
+from typing import Dict, Optional, List
 
-# Load environment variables
-load_dotenv()
+logger = logging.getLogger(__name__)
 
 class SliteAPI:
-    def __init__(self):
-        self.api_key = os.getenv('SLITE_API_KEY')
-        self.base_url = 'https://api.slite.com/v1'
-        self.cache = Cache()
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+        self.base_url = "https://api.slite.com"
         self.headers = {
-            'Content-Type': 'application/json',
-            'Accept': 'application/json',
-            'x-slite-api-key': self.api_key
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json"
         }
+
+    def _convert_text_to_prosemirror_node(self, text: str) -> Dict:
+        """Convert a text string to a ProseMirror text node"""
+        return {
+            "type": "text",
+            "text": text
+        }
+
+    def _convert_to_prosemirror(self, content: str) -> Dict:
+        """Convert content to ProseMirror format"""
+        lines = content.split('\n')
+        doc_content = []
         
-    def _handle_response(self, response: requests.Response) -> Dict:
-        """Handle API response and raise appropriate errors"""
-        try:
-            if response.status_code == 200:
-                return response.json()
-            elif response.status_code == 429:
-                raise RateLimitError("API rate limit exceeded", response.status_code)
-            elif response.status_code == 401:
-                raise AuthenticationError("Invalid API key", response.status_code)
-            elif response.status_code == 404:
-                raise NotFoundError("Resource not found", response.status_code)
-            elif response.status_code == 400:
-                raise ValidationError("Invalid request", response.status_code)
-            else:
-                raise APIError(f"API request failed: {response.text}", response.status_code)
-        except json.JSONDecodeError:
-            raise APIError("Invalid JSON response from API")
-
-    @retry_with_backoff(retries=3)
-    def test_connection(self):
-        """Test the API connection using a known document ID"""
-        test_doc_id = "lRzWKw9G6XtOUT"  # Using the Agent_Integration document
-        try:
-            response = requests.get(
-                f'{self.base_url}/notes/{test_doc_id}',
-                headers=self.headers
-            )
-            data = self._handle_response(response)
-            return data
-        except requests.exceptions.RequestException as e:
-            print(f"Error connecting to Slite API: {e}")
-            return None
-
-    @retry_with_backoff(retries=3)
-    def create_note(self, note: MeetingNote, parent_note_id: Optional[str] = None) -> NoteResponse:
-        """Create a new note"""
-        try:
-            # Prepare the content in the correct format
-            content = f"# {note.title}\n\n{note.content}"
-            if note.project:
-                content += f"\n\n## Project\n{note.project}"
-            if note.department:
-                content += f"\n\n## Department\n{note.department}"
-            if note.participants:
-                content += f"\n\n## Participants\n" + "\n".join([f"- {p}" for p in note.participants])
-            if note.tags:
-                content += f"\n\n## Tags\n" + ", ".join(note.tags)
+        current_list = None
+        current_section = None
+        current_paragraph = None
+        
+        for line in lines:
+            line = line.rstrip()
             
-            payload = {
-                "title": note.title,
-                "content": content
+            # Skip empty lines
+            if not line:
+                if current_list:
+                    doc_content.append(current_list)
+                    current_list = None
+                if current_paragraph:
+                    doc_content.append(current_paragraph)
+                doc_content.append({
+                    "type": "paragraph",
+                    "content": [{"type": "text", "text": ""}]
+                })
+                continue
+            
+            # Handle bullet points
+            if line.strip().startswith('- '):
+                text = line.strip()[2:]
+                if current_list is None:
+                    current_list = {
+                        "type": "bulletList",
+                        "content": []
+                    }
+                list_item = {
+                    "type": "listItem",
+                    "content": [{
+                        "type": "paragraph",
+                        "content": [{"type": "text", "text": text}]
+                    }]
+                }
+                current_list["content"].append(list_item)
+                
+            # Handle section headers
+            elif line.startswith('Meeting Notes:') or line.startswith('Date:') or line.startswith('Time:') or line.startswith('Attendees:') or line.startswith('Facilitator:'):
+                if current_list:
+                    doc_content.append(current_list)
+                    current_list = None
+                if current_paragraph:
+                    doc_content.append(current_paragraph)
+                    current_paragraph = None
+                    
+                doc_content.append({
+                    "type": "heading",
+                    "attrs": {"level": 2},
+                    "content": [{"type": "text", "text": line}]
+                })
+                
+            # Handle numbered sections
+            elif line[0].isdigit() and line[1] == '.':
+                if current_list:
+                    doc_content.append(current_list)
+                    current_list = None
+                if current_paragraph:
+                    doc_content.append(current_paragraph)
+                    current_paragraph = None
+                    
+                doc_content.append({
+                    "type": "heading",
+                    "attrs": {"level": 2},
+                    "content": [{"type": "text", "text": line}]
+                })
+                
+            # Regular text
+            else:
+                if current_list:
+                    doc_content.append(current_list)
+                    current_list = None
+                    
+                if not current_paragraph:
+                    current_paragraph = {
+                        "type": "paragraph",
+                        "content": []
+                    }
+                current_paragraph["content"].append({
+                    "type": "text", 
+                    "text": line
+                })
+        
+        # Add any remaining content
+        if current_list:
+            doc_content.append(current_list)
+        if current_paragraph:
+            doc_content.append(current_paragraph)
+            
+        return {
+            "type": "doc",
+            "content": doc_content
+        }
+
+    def create_folder(self, name: str, description: str = "") -> Dict:
+        """Create a new folder in Slite by creating a special note"""
+        try:
+            endpoint = f"{self.base_url}/v1/notes"
+            
+            # Create a folder using note with special format
+            markdown_content = f"""# {name}
+
+{description}
+
+---
+This is a folder for organizing content.
+"""
+            
+            data = {
+                "title": name,
+                "markdown": markdown_content,
+                "isFolder": True  # Indicate this is a folder
             }
-            if parent_note_id:
-                payload["parentNoteId"] = parent_note_id
             
             response = requests.post(
-                f'{self.base_url}/notes',
+                endpoint,
                 headers=self.headers,
-                json=payload
+                json=data
             )
-            data = self._handle_response(response)
             
-            return NoteResponse(
-                note_id=data["id"],
-                title=data["title"],
-                folder_id=parent_note_id,
-                created_at=datetime.now(),
-                updated_at=datetime.fromisoformat(data["updatedAt"].replace("Z", "+00:00")),
-                status="success"
-            )
-        except requests.exceptions.RequestException as e:
-            print(f"Error creating note: {e}")
-            return NoteResponse(
-                note_id="",
-                title=note.title,
-                status="error",
-                message=str(e),
-                created_at=datetime.now(),
-                updated_at=datetime.now()
-            )
+            if response.status_code in [200, 201]:
+                result = response.json()
+                # Convert note response to folder format
+                return {
+                    "id": result.get("id"),
+                    "name": name,
+                    "description": description,
+                    "url": result.get("url")
+                }
+            else:
+                logger.error(f"Error creating folder: {response.text}")
+                response.raise_for_status()
+                
+        except Exception as e:
+            logger.error(f"Error creating folder: {str(e)}")
+            raise
 
-    @retry_with_backoff(retries=3)
-    def update_note(self, note_id: str, note: MeetingNote) -> NoteResponse:
-        """Update an existing note"""
+    def create_document(self, title: str, markdown_content: str, folder_id: Optional[str] = None) -> Dict:
+        """Create a new document in Slite"""
         try:
-            # Prepare the content in the correct format
-            content = f"# {note.title}\n\n{note.content}"
-            if note.project:
-                content += f"\n\n## Project\n{note.project}"
-            if note.department:
-                content += f"\n\n## Department\n{note.department}"
-            if note.participants:
-                content += f"\n\n## Participants\n" + "\n".join([f"- {p}" for p in note.participants])
-            if note.tags:
-                content += f"\n\n## Tags\n" + ", ".join(note.tags)
-            
-            payload = {
-                "title": note.title,
-                "content": content
+            endpoint = f"{self.base_url}/v1/notes"
+            data = {
+                "title": title,
+                "markdown": markdown_content
             }
             
-            response = requests.put(
-                f'{self.base_url}/notes/{note_id}',
+            if folder_id:
+                data["parentNoteId"] = folder_id  # Use parentNoteId for folder association
+            
+            response = requests.post(
+                endpoint,
                 headers=self.headers,
-                json=payload
+                json=data
             )
-            data = self._handle_response(response)
             
-            return NoteResponse(
-                note_id=data["id"],
-                title=data["title"],
-                folder_id=data.get("parentNoteId"),
-                created_at=datetime.now(),
-                updated_at=datetime.fromisoformat(data["updatedAt"].replace("Z", "+00:00")),
-                status="success"
-            )
-        except requests.exceptions.RequestException as e:
-            print(f"Error updating note: {e}")
-            return NoteResponse(
-                note_id=note_id,
-                title=note.title,
-                status="error",
-                message=str(e),
-                created_at=datetime.now(),
-                updated_at=datetime.now()
-            )
-
-    @retry_with_backoff(retries=3)
-    def get_note(self, note_id: str) -> Optional[Dict]:
-        """Get a specific note by ID"""
-        cache_key = f"note_{note_id}"
-        cached_data = self.cache.get(cache_key)
-        if cached_data:
-            return cached_data
-
-        try:
-            response = requests.get(
-                f'{self.base_url}/notes/{note_id}',
-                headers=self.headers
-            )
-            data = self._handle_response(response)
-            self.cache.set(cache_key, data)
-            return data
-        except requests.exceptions.RequestException as e:
-            print(f"Error getting note: {e}")
-            return None
-
-    @retry_with_backoff(retries=3)
-    def delete_note(self, note_id: str) -> bool:
-        """Delete a note"""
-        try:
-            # Try direct deletion first
-            response = requests.delete(
-                f'{self.base_url}/notes/{note_id}',
-                headers=self.headers,
-                json={"archived": True}  # Add archived flag in the payload
-            )
-            data = self._handle_response(response)
-            
-            # Clear cache
-            cache_key = f"note_{note_id}"
-            self.cache.set(cache_key, None)
-            
-            return True
-        except requests.exceptions.RequestException as e:
-            print(f"Error deleting note: {e}")
-            return False
-
-    @retry_with_backoff(retries=3)
-    def list_notes(self, parent_id: Optional[str] = None) -> List[Dict]:
-        """
-        List notes. Note: The Slite API has limitations on listing all notes.
-        It's recommended to:
-        1. Keep track of note IDs when creating notes
-        2. Use get_note() to fetch specific notes
-        3. Provide a parent_id to list notes within a specific folder
-        """
-        try:
-            if parent_id:
-                # If parent_id is provided, try to get notes within that folder
-                response = requests.get(
-                    f'{self.base_url}/notes/{parent_id}/children',
-                    headers=self.headers
-                )
-                data = self._handle_response(response)
-                return data
+            if response.status_code in [200, 201]:
+                return response.json()
             else:
-                print("Warning: Listing all notes is not supported by the Slite API.")
-                print("Please provide a parent_id to list notes within a specific folder,")
-                print("or use get_note() to fetch specific notes by their IDs.")
-                return []
-        except requests.exceptions.RequestException as e:
-            print(f"Error listing notes: {e}")
-            return []
+                logger.error(f"Error creating document: {response.text}")
+                response.raise_for_status()
+                
+        except Exception as e:
+            logger.error(f"Error creating document: {str(e)}")
+            raise
 
-    @retry_with_backoff(retries=3)
-    def update_block(self, doc_id: str, block_id: str, title: str, content: str, status: Optional[Dict] = None, url: Optional[str] = None) -> Dict:
-        """Update a block in a document"""
+    def format_meeting_notes_markdown(self, notes_data: dict) -> str:
+        """Format meeting notes as markdown"""
+        markdown = []
+        
+        # Add metadata
+        metadata = notes_data.get("metadata", {})
+        markdown.append("# Meeting Details\n")
+        markdown.append(f"**Date:** {metadata.get('date', 'N/A')}")
+        markdown.append(f"**Time:** {metadata.get('time', 'N/A')}")
+        markdown.append(f"**Attendees:** {metadata.get('attendees_count', 0)} attendees")
+        markdown.append(f"**Facilitator:** {metadata.get('facilitator', 'N/A')}\n")
+        
+        # Add sections
+        for section in notes_data.get("sections", []):
+            markdown.append(f"# {section.get('title', 'Untitled Section')}")
+            
+            for item in section.get("content", []):
+                if item.get("subtitle"):
+                    markdown.append(f"## {item['subtitle']}")
+                
+                details = item.get("details", "")
+                if isinstance(details, list):
+                    for detail in details:
+                        markdown.append(f"- {detail}")
+                else:
+                    markdown.append(details)
+                
+            markdown.append("")  # Add empty line between sections
+        
+        return "\n".join(markdown)
+
+    def create_note(self, title: str, content: str) -> Dict:
+        """Create a new note in Slite"""
         try:
-            payload = {
+            endpoint = f"{self.base_url}/v1/notes"
+            
+            # Convert content to ProseMirror format
+            content = self._convert_to_prosemirror(content)
+            
+            data = {
                 "title": title,
                 "content": content
             }
-            if status:
-                payload["status"] = status
-            if url:
-                payload["url"] = url
-
-            response = requests.put(
-                f'{self.base_url}/notes/{doc_id}/tiles/{block_id}',
-                headers=self.headers,
-                json=payload
-            )
-            data = self._handle_response(response)
-            return data
-        except requests.exceptions.RequestException as e:
-            print(f"Error updating block: {e}")
-            return None
-
-    # Folder Management Methods
-    @retry_with_backoff(retries=3)
-    def create_folder(self, folder: FolderStructure) -> FolderResponse:
-        """Create a new folder"""
-        try:
-            payload = {
-                "title": folder.name,  # Changed from name to title
-                "content": folder.description or ""  # Changed from description to content
-            }
-            if folder.parent_id:
-                payload["parentNoteId"] = folder.parent_id
             
-            # Use the notes endpoint instead of folders
+            logger.debug(f"Creating note with title: {title}")
+            logger.debug(f"Content structure: {content}")
+            
             response = requests.post(
-                f'{self.base_url}/notes',
+                endpoint,
                 headers=self.headers,
-                json=payload
+                json=data
             )
-            data = self._handle_response(response)
             
-            return FolderResponse(
-                folder_id=data["id"],
-                name=data["title"],  # Changed from name to title
-                created_at=datetime.now(),
-                updated_at=datetime.fromisoformat(data["updatedAt"].replace("Z", "+00:00")),
-                status="success",
-                parent_id=folder.parent_id
-            )
+            if response.status_code in [200, 201]:
+                logger.info(f"Successfully created note with content")
+                return response.json()
+            elif response.status_code == 429:
+                raise Exception("Rate limit exceeded")
+            elif response.status_code == 401:
+                raise Exception("Invalid API key")
+            else:
+                logger.error(f"Error creating note: {response.text}")
+                raise Exception(f"Error creating note: {response.text}")
+                
         except requests.exceptions.RequestException as e:
-            print(f"Error creating folder: {e}")
-            return FolderResponse(
-                folder_id="",
-                name=folder.name,
-                status="error",
-                message=str(e),
-                created_at=datetime.now(),
-                updated_at=datetime.now()
-            )
+            logger.error(f"Error creating note: {str(e)}")
+            raise Exception(f"Network error: {str(e)}")
 
-    @retry_with_backoff(retries=3)
-    def update_folder(self, folder_id: str, folder: FolderStructure) -> FolderResponse:
-        """Update an existing folder"""
+    def update_note(self, note_id: str, title: str, content: str) -> Dict:
+        """Update an existing note in Slite"""
         try:
-            payload = {
-                "title": folder.name,  # Changed from name to title
-                "content": folder.description or ""  # Changed from description to content
+            endpoint = f"{self.base_url}/v1/notes/{note_id}"
+            
+            # Convert content to ProseMirror format
+            content = self._convert_to_prosemirror(content)
+            
+            data = {
+                "title": title,
+                "content": content
             }
             
-            response = requests.put(
-                f'{self.base_url}/notes/{folder_id}',
+            logger.debug(f"Updating note {note_id}")
+            response = requests.patch(
+                endpoint,
                 headers=self.headers,
-                json=payload
+                json=data
             )
-            data = self._handle_response(response)
             
-            return FolderResponse(
-                folder_id=data["id"],
-                name=data["title"],  # Changed from name to title
-                created_at=datetime.now(),
-                updated_at=datetime.fromisoformat(data["updatedAt"].replace("Z", "+00:00")),
-                status="success",
-                parent_id=folder.parent_id
-            )
+            if response.status_code == 200:
+                logger.info(f"Successfully updated note {note_id}")
+                return response.json()
+            elif response.status_code == 429:
+                raise Exception("Rate limit exceeded")
+            elif response.status_code == 401:
+                raise Exception("Invalid API key")
+            elif response.status_code == 404:
+                raise Exception(f"Note {note_id} not found")
+            else:
+                raise Exception(f"Error updating note: {response.text}")
+                
         except requests.exceptions.RequestException as e:
-            print(f"Error updating folder: {e}")
-            return FolderResponse(
-                folder_id=folder_id,
-                name=folder.name,
-                status="error",
-                message=str(e),
-                created_at=datetime.now(),
-                updated_at=datetime.now()
-            )
+            logger.error(f"Error updating note: {str(e)}")
+            raise Exception(f"Network error: {str(e)}")
 
-    @retry_with_backoff(retries=3)
-    def delete_folder(self, folder_id: str) -> bool:
-        """Delete a folder"""
+    def get_note(self, note_id: str) -> Dict:
+        """Get a note from Slite"""
         try:
-            response = requests.delete(
-                f'{self.base_url}/notes/{folder_id}',
-                headers=self.headers
-            )
+            endpoint = f"{self.base_url}/v1/notes/{note_id}"
+            response = requests.get(endpoint, headers=self.headers)
             
-            # Clear cache
-            cache_key = f"folder_{folder_id}"
-            self.cache.set(cache_key, None)
-            
-            return response.status_code == 204
+            if response.status_code == 200:
+                return response.json()
+            elif response.status_code == 429:
+                raise Exception("Rate limit exceeded")
+            elif response.status_code == 401:
+                raise Exception("Invalid API key")
+            elif response.status_code == 404:
+                raise Exception(f"Note {note_id} not found")
+            else:
+                raise Exception(f"Error getting note: {response.text}")
+                
         except requests.exceptions.RequestException as e:
-            print(f"Error deleting folder: {e}")
-            return False
+            logger.error(f"Error getting note: {str(e)}")
+            raise Exception(f"Network error: {str(e)}")
 
-    @retry_with_backoff(retries=3)
-    def get_folder(self, folder_id: str) -> Optional[Dict]:
-        """Get a folder by ID"""
-        cache_key = f"folder_{folder_id}"
-        cached_data = self.cache.get(cache_key)
-        if cached_data:
-            return cached_data
-
+    def search_notes(self, query: str) -> List[Dict]:
+        """Search for notes in Slite"""
         try:
-            response = requests.get(
-                f'{self.base_url}/notes/{folder_id}',
-                headers=self.headers
-            )
-            data = self._handle_response(response)
-            self.cache.set(cache_key, data)
-            return data
+            endpoint = f"{self.base_url}/v1/notes/search"
+            response = requests.get(endpoint, headers=self.headers, params={"query": query})
+            
+            if response.status_code == 200:
+                return response.json()
+            elif response.status_code == 429:
+                raise Exception("Rate limit exceeded")
+            elif response.status_code == 401:
+                raise Exception("Invalid API key")
+            else:
+                raise Exception(f"Error searching notes: {response.text}")
+                
         except requests.exceptions.RequestException as e:
-            print(f"Error getting folder: {e}")
-            return None
+            logger.error(f"Error searching notes: {str(e)}")
+            raise Exception(f"Network error: {str(e)}")
+
+    def delete_note(self, note_id: str) -> Dict:
+        """Delete a note from Slite"""
+        try:
+            endpoint = f"{self.base_url}/v1/notes/{note_id}"
+            response = requests.delete(endpoint, headers=self.headers)
+            
+            if response.status_code == 204:
+                return {"status": "success", "message": f"Note {note_id} deleted successfully"}
+            elif response.status_code == 429:
+                raise Exception("Rate limit exceeded")
+            elif response.status_code == 401:
+                raise Exception("Invalid API key")
+            elif response.status_code == 404:
+                raise Exception(f"Note {note_id} not found")
+            else:
+                raise Exception(f"Error deleting note: {response.text}")
+                
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Error deleting note: {str(e)}")
+            raise Exception(f"Network error: {str(e)}")
 
 if __name__ == "__main__":
     # Test the API connection
-    slite = SliteAPI()
+    slite = SliteAPI("your_api_key")
     
     print("Testing Slite API connection...")
-    result = slite.test_connection()
+    result = slite.get_note("your_note_id")
     if result:
         print("Successfully connected to Slite API!")
-        print(f"Notes: {result}")
     else:
         print("Failed to connect to Slite API. Please check your API key and internet connection.")

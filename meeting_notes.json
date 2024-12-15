@@ -1,0 +1,46 @@
+{
+	"title": "Introduction to Machine Learning",
+	"metadata": {
+		"date": "December 12, 2024",
+		"time": "10:00 AM - 11:00 AM",
+		"attendees_count": 25,
+		"facilitator": "Vijay",
+		"end_time": "11:00 AM"
+	},
+	"sections": [
+		{
+			"title": "Welcome & Overview",
+			"content": [
+				{
+					"subtitle": "Introduction to the topic of Machine Learning (ML)",
+					"details": "The meeting began with a brief introduction to Machine Learning, explaining its importance and growing presence across various industries like healthcare, finance, and e-commerce."
+				},
+				{
+					"subtitle": "Purpose of the Meeting",
+					"details": "To provide an overview of what ML is, its types, and real-world applications. The session aimed at demystifying ML for beginners and setting the stage for deeper dives in future sessions."
+				}
+			]
+		},
+		{
+			"title": "What is Machine Learning?",
+			"content": [
+				{
+					"subtitle": "Definition",
+					"details": "Machine Learning is a subset of Artificial Intelligence (AI) focused on building systems that can learn from data and improve over time without explicit programming."
+				},
+				{
+					"subtitle": "Key Concepts",
+					"details": [
+						"Algorithms: Mathematical procedures or rules that help make decisions or predictions based on data.",
+						"Training: Feeding data to an algorithm so it can learn patterns.",
+						"Prediction: Using learned patterns to make decisions or predict outcomes on new data."
+					]
+				},
+				{
+					"subtitle": "Example",
+					"details": "Email spam filters, recommendation systems (Netflix, Amazon), and voice assistants like Siri or Alexa."
+				}
+			]
+		}
+	]
+}
