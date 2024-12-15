@@ -1,8 +1,57 @@
 import requests
 import logging
-from typing import Dict, Optional, List
+from typing import Dict, Optional, List, Callable
+from datetime import datetime
+import json
 
 logger = logging.getLogger(__name__)
+
+class SliteEventHandler:
+    def __init__(self):
+        self.folder_created_handlers: List[Callable] = []
+        self.folder_updated_handlers: List[Callable] = []
+        self.document_created_handlers: List[Callable] = []
+        self.document_updated_handlers: List[Callable] = []
+        
+    def on_folder_created(self, handler: Callable):
+        self.folder_created_handlers.append(handler)
+        
+    def on_folder_updated(self, handler: Callable):
+        self.folder_updated_handlers.append(handler)
+        
+    def on_document_created(self, handler: Callable):
+        self.document_created_handlers.append(handler)
+        
+    def on_document_updated(self, handler: Callable):
+        self.document_updated_handlers.append(handler)
+        
+    def trigger_folder_created(self, folder_data: Dict):
+        for handler in self.folder_created_handlers:
+            try:
+                handler(folder_data)
+            except Exception as e:
+                logger.error(f"Error in folder created handler: {str(e)}")
+                
+    def trigger_folder_updated(self, folder_data: Dict):
+        for handler in self.folder_updated_handlers:
+            try:
+                handler(folder_data)
+            except Exception as e:
+                logger.error(f"Error in folder updated handler: {str(e)}")
+                
+    def trigger_document_created(self, document_data: Dict):
+        for handler in self.document_created_handlers:
+            try:
+                handler(document_data)
+            except Exception as e:
+                logger.error(f"Error in document created handler: {str(e)}")
+                
+    def trigger_document_updated(self, document_data: Dict):
+        for handler in self.document_updated_handlers:
+            try:
+                handler(document_data)
+            except Exception as e:
+                logger.error(f"Error in document updated handler: {str(e)}")
 
 class SliteAPI:
     def __init__(self, api_key: str):
@@ -12,6 +61,18 @@ class SliteAPI:
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json"
         }
+        self.events = SliteEventHandler()
+
+    def add_metadata(self, data: Dict) -> Dict:
+        """Add metadata to the data dictionary"""
+        if "metadata" not in data:
+            data["metadata"] = {}
+            
+        data["metadata"].update({
+            "last_updated": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "updated_by": "Slite Integration Agent"
+        })
+        return data
 
     def _convert_text_to_prosemirror_node(self, text: str) -> Dict:
         """Convert a text string to a ProseMirror text node"""
@@ -136,8 +197,11 @@ This is a folder for organizing content.
             data = {
                 "title": name,
                 "markdown": markdown_content,
-                "isFolder": True  # Indicate this is a folder
+                "isFolder": True
             }
+            
+            # Add metadata
+            data = self.add_metadata(data)
             
             response = requests.post(
                 endpoint,
@@ -147,13 +211,16 @@ This is a folder for organizing content.
             
             if response.status_code in [200, 201]:
                 result = response.json()
-                # Convert note response to folder format
-                return {
+                folder_data = {
                     "id": result.get("id"),
                     "name": name,
                     "description": description,
-                    "url": result.get("url")
+                    "url": result.get("url"),
+                    "metadata": data.get("metadata", {})
                 }
+                # Trigger folder created event
+                self.events.trigger_folder_created(folder_data)
+                return folder_data
             else:
                 logger.error(f"Error creating folder: {response.text}")
                 response.raise_for_status()
@@ -172,7 +239,10 @@ This is a folder for organizing content.
             }
             
             if folder_id:
-                data["parentNoteId"] = folder_id  # Use parentNoteId for folder association
+                data["parentNoteId"] = folder_id
+                
+            # Add metadata
+            data = self.add_metadata(data)
             
             response = requests.post(
                 endpoint,
@@ -181,7 +251,12 @@ This is a folder for organizing content.
             )
             
             if response.status_code in [200, 201]:
-                return response.json()
+                result = response.json()
+                # Add our metadata to the result
+                result["metadata"] = data.get("metadata", {})
+                # Trigger document created event
+                self.events.trigger_document_created(result)
+                return result
             else:
                 logger.error(f"Error creating document: {response.text}")
                 response.raise_for_status()
@@ -375,6 +450,9 @@ This is a folder for organizing content.
                 "isFolder": True
             }
             
+            # Add metadata
+            data = self.add_metadata(data)
+            
             response = requests.put(
                 endpoint,
                 headers=self.headers,
@@ -383,12 +461,16 @@ This is a folder for organizing content.
             
             if response.status_code in [200, 201]:
                 result = response.json()
-                return {
+                folder_data = {
                     "id": result.get("id"),
                     "name": name,
                     "description": description,
-                    "url": result.get("url")
+                    "url": result.get("url"),
+                    "metadata": data.get("metadata", {})
                 }
+                # Trigger folder updated event
+                self.events.trigger_folder_updated(folder_data)
+                return folder_data
             else:
                 logger.error(f"Error updating folder: {response.text}")
                 response.raise_for_status()
@@ -429,6 +511,9 @@ This is a folder for organizing content.
             
             if folder_id:
                 data["parentNoteId"] = folder_id
+                
+            # Add metadata
+            data = self.add_metadata(data)
             
             response = requests.put(
                 endpoint,
@@ -437,7 +522,12 @@ This is a folder for organizing content.
             )
             
             if response.status_code in [200, 201]:
-                return response.json()
+                result = response.json()
+                # Add our metadata to the result
+                result["metadata"] = data.get("metadata", {})
+                # Trigger document updated event
+                self.events.trigger_document_updated(result)
+                return result
             else:
                 logger.error(f"Error updating document: {response.text}")
                 response.raise_for_status()
@@ -445,6 +535,27 @@ This is a folder for organizing content.
         except Exception as e:
             logger.error(f"Error updating document: {str(e)}")
             raise
+
+    def delete_document(self, doc_id: str) -> Dict:
+        """Delete a document from Slite"""
+        try:
+            endpoint = f"{self.base_url}/v1/notes/{doc_id}"
+            response = requests.delete(endpoint, headers=self.headers)
+            
+            if response.status_code == 204:
+                return {"status": "success", "message": f"Document {doc_id} deleted successfully"}
+            elif response.status_code == 429:
+                raise Exception("Rate limit exceeded")
+            elif response.status_code == 401:
+                raise Exception("Invalid API key")
+            elif response.status_code == 404:
+                raise Exception(f"Document {doc_id} not found")
+            else:
+                raise Exception(f"Error deleting document: {response.text}")
+                
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Error deleting document: {str(e)}")
+            raise Exception(f"Network error: {str(e)}")
 
 if __name__ == "__main__":
     # Test the API connection
