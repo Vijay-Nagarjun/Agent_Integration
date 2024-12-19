@@ -1,0 +1,81 @@
+Slite Integration Project - File Descriptions
+
+This document provides an overview of each Python file in the Slite Integration project
+and explains their primary purposes and functionalities.
+
+1. slite_api.py
+---------------
+The core API integration module that handles direct communication with the Slite API.
+It provides a comprehensive interface for creating, updating, and managing documents
+and folders in Slite. The module includes event handling capabilities and implements
+proper error handling for API responses. It serves as the foundation for all Slite
+operations in the project.
+
+2. note_manager.py
+-----------------
+A high-level manager class that provides a simplified interface for handling notes
+and folders. It acts as a wrapper around the Slite API, adding additional
+functionality like metadata management and error handling. This module makes it
+easier to perform common operations without dealing directly with the API details.
+
+3. text_to_json_converter.py
+---------------------------
+Specialized module for converting structured text meeting notes into a JSON format.
+It handles parsing of meeting metadata, section organization, and hierarchical
+content structure. The module is essential for maintaining consistency in how
+meeting notes are stored and processed within the system.
+
+4. utils.py
+----------
+Utility module providing common functionality used across the project. It includes:
+- Logging configuration
+- Rate limiting implementation
+- Caching mechanisms
+- Retry logic with exponential backoff
+- Custom exception classes
+These utilities ensure robust operation and proper error handling throughout the
+application.
+
+5. exceptions.py
+---------------
+Defines custom exception classes for handling various types of errors that may
+occur during API operations. It includes specific exceptions for rate limiting,
+authentication failures, resource not found errors, and validation issues.
+
+6. models.py
+-----------
+Contains Pydantic models that define the data structures used throughout the
+application. It ensures proper data validation and serialization for meeting
+notes and folder structures, maintaining data integrity across the system.
+
+7. cleanup.py
+------------
+Maintenance script for cleaning up test notes and maintaining a clean workspace.
+It provides functionality to search for and remove test documents, helping to
+keep the Slite workspace organized.
+
+8. run_demo.py
+-------------
+Interactive demonstration script that showcases the capabilities of the Slite
+integration. It provides a menu-driven interface for:
+- Creating and managing documents
+- Organizing folders
+- Demonstrating event handling
+- Testing automatic cleanup features
+This script serves as both a demonstration and a testing tool for the integration.
+
+Integration Architecture:
+-----------------------
+The project follows a layered architecture:
+1. API Layer (slite_api.py) - Handles direct API communication
+2. Business Logic Layer (note_manager.py) - Implements core functionality
+3. Data Layer (models.py) - Defines data structures
+4. Utility Layer (utils.py, exceptions.py) - Provides support functions
+5. Interface Layer (run_demo.py) - Offers user interaction
+
+This modular design ensures:
+- Clear separation of concerns
+- Easy maintenance and updates
+- Scalable functionality
+- Robust error handling
+- Efficient resource utilization

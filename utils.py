@@ -1,3 +1,17 @@
+"""
+Utilities Module
+
+This module provides various utility functions and classes for the Slite integration:
+- Logging setup
+- Rate limiting
+- Caching
+- Retry mechanisms
+- Custom exceptions
+
+The utilities here support the main application by providing common functionality
+and error handling mechanisms.
+"""
+
 import logging
 import time
 from functools import wraps
@@ -8,8 +22,16 @@ import os
 from cachetools import TTLCache
 import random
 
-# Configure logging
 def setup_logging(log_file: str = 'slite_integration.log'):
+    """
+    Configure logging for the application.
+    
+    Args:
+        log_file (str): Path to the log file
+        
+    Returns:
+        Logger: Configured logger instance
+    """
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -20,21 +42,40 @@ def setup_logging(log_file: str = 'slite_integration.log'):
     )
     return logging.getLogger('slite_integration')
 
+# Initialize logger
 logger = setup_logging()
 
-# Cache configuration
+# Configure caches with time-to-live (TTL)
 note_cache = TTLCache(maxsize=100, ttl=300)  # Cache for 5 minutes
 folder_cache = TTLCache(maxsize=50, ttl=600)  # Cache for 10 minutes
 
 class RateLimiter:
+    """
+    Rate limiter to prevent API throttling.
+    Implements a sliding window rate limiting algorithm.
+    """
+    
     def __init__(self, max_requests: int = 60, time_window: int = 60):
+        """
+        Initialize rate limiter.
+        
+        Args:
+            max_requests (int): Maximum number of requests allowed in the time window
+            time_window (int): Time window in seconds
+        """
         self.max_requests = max_requests
         self.time_window = time_window
         self.requests = []
 
     def can_make_request(self) -> bool:
+        """
+        Check if a new request can be made within rate limits.
+        
+        Returns:
+            bool: True if request is allowed, False otherwise
+        """
         current_time = time.time()
-        # Remove old requests
+        # Remove old requests outside the time window
         self.requests = [req_time for req_time in self.requests 
                         if current_time - req_time < self.time_window]
         
@@ -44,13 +85,24 @@ class RateLimiter:
         return False
 
     def wait_for_next_slot(self):
+        """Wait until a request slot becomes available."""
         while not self.can_make_request():
             time.sleep(1)
 
+# Initialize global rate limiter
 rate_limiter = RateLimiter()
 
 def retry_with_backoff(retries: int = 3, backoff_in_seconds: int = 1):
-    """Retry decorator with exponential backoff"""
+    """
+    Decorator for retrying functions with exponential backoff.
+    
+    Args:
+        retries (int): Maximum number of retry attempts
+        backoff_in_seconds (int): Initial backoff time in seconds
+        
+    Returns:
+        Callable: Decorated function with retry logic
+    """
     def decorator(func: Callable):
         @wraps(func)
         def wrapper(*args, **kwargs):
@@ -74,13 +126,28 @@ def retry_with_backoff(retries: int = 3, backoff_in_seconds: int = 1):
     return decorator
 
 class Cache:
-    """Simple file-based cache"""
+    """
+    Simple file-based cache implementation for storing key-value pairs.
+    Provides persistent storage between application runs.
+    """
+    
     def __init__(self, cache_file: str):
+        """
+        Initialize cache with specified file.
+        
+        Args:
+            cache_file (str): Path to the cache file
+        """
         self.cache_file = cache_file
         self._cache = self._load_cache()
 
     def _load_cache(self) -> dict:
-        """Load cache from file"""
+        """
+        Load cache data from file.
+        
+        Returns:
+            dict: Loaded cache data or empty dict if file doesn't exist
+        """
         try:
             with open(self.cache_file, 'r') as f:
                 return json.load(f)
@@ -88,43 +155,60 @@ class Cache:
             return {}
 
     def _save_cache(self):
-        """Save cache to file"""
+        """Save current cache data to file."""
         with open(self.cache_file, 'w') as f:
             json.dump(self._cache, f)
 
     def get(self, key: str) -> Optional[str]:
-        """Get value from cache"""
+        """
+        Retrieve value from cache.
+        
+        Args:
+            key (str): Cache key
+            
+        Returns:
+            Optional[str]: Cached value or None if not found
+        """
         return self._cache.get(key)
 
     def set(self, key: str, value: str):
-        """Set value in cache"""
+        """
+        Store value in cache.
+        
+        Args:
+            key (str): Cache key
+            value (str): Value to store
+        """
         self._cache[key] = value
         self._save_cache()
 
     def clear(self):
-        """Clear the cache"""
+        """Clear all cached data."""
         self._cache = {}
         self._save_cache()
 
 class APIError(Exception):
-    """Base exception for API errors"""
+    """
+    Base exception class for API-related errors.
+    Provides status code support for HTTP errors.
+    """
     def __init__(self, message: str, status_code: Optional[int] = None):
         self.message = message
         self.status_code = status_code
         super().__init__(self.message)
 
 class RateLimitError(APIError):
-    """Raised when API rate limit is exceeded"""
+    """Raised when API rate limit is exceeded."""
     pass
 
 class AuthenticationError(APIError):
-    """Raised when API authentication fails"""
+    """Raised when API authentication fails."""
     pass
 
 class NotFoundError(APIError):
-    """Raised when a resource is not found"""
+    """Raised when a resource is not found."""
     pass
 
 class ValidationError(APIError):
-    """Raised when input validation fails"""
+    """Raised when input validation fails."""
     pass

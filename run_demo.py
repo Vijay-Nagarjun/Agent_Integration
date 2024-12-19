@@ -7,6 +7,7 @@ from slite_api import SliteAPI
 from datetime import datetime, timedelta
 import sys
 import threading
+from text_to_json_converter import convert_notes_to_json
 
 # Configure logging
 logging.basicConfig(
@@ -15,9 +16,36 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-def read_meeting_notes():
-    """Read meeting notes from JSON file"""
+def convert_text_to_json():
+    """
+    Convert meeting notes from text to JSON format before processing.
+    This function is automatically called before reading meeting notes to ensure
+    the JSON file is up to date with the latest text content.
+    """
     try:
+        convert_notes_to_json('meeting_notes.txt', 'meeting_notes.json')
+        logger.info("Successfully converted meeting notes from text to JSON")
+    except Exception as e:
+        logger.error(f"Error converting meeting notes: {str(e)}")
+        raise
+
+def read_meeting_notes():
+    """
+    Read meeting notes from JSON file.
+    This function is called after text_to_json conversion to ensure
+    we're working with the latest data.
+    
+    Returns:
+        dict: The meeting notes data in JSON format
+    
+    Raises:
+        FileNotFoundError: If the JSON file doesn't exist
+        JSONDecodeError: If the JSON file is invalid
+    """
+    try:
+        # First, convert the latest text to JSON
+        convert_text_to_json()
+        # Then read the JSON file
         with open('meeting_notes.json', 'r') as f:
             return json.load(f)
     except FileNotFoundError:
@@ -229,7 +257,11 @@ class DeletionTimer:
         self.event.wait()
 
 def demo_folder_operations(slite: SliteAPI):
-    """Demonstrate folder operations"""
+    """
+    Demonstrate folder operations.
+    This function showcases the creation, update, and deletion of folders and documents.
+    It also demonstrates the use of event handlers for folder and document events.
+    """
     try:
         # Register event handlers
         slite.events.on_folder_created(on_folder_created)
@@ -304,6 +336,14 @@ def demo_folder_operations(slite: SliteAPI):
         raise
 
 if __name__ == "__main__":
+    """
+    Main execution flow:
+    1. Load environment variables
+    2. Initialize Slite API client
+    3. Convert text notes to JSON (automatic)
+    4. Process meeting notes and interact with Slite
+    5. Handle user interactions through menu system
+    """
     load_dotenv()
     api_key = os.getenv("SLITE_API_KEY")
     
