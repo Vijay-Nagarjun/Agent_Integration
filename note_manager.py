@@ -8,6 +8,9 @@ while providing proper error handling and logging.
 
 import logging
 from typing import Dict, Optional, List
+import asyncio
+import re
+from functools import lru_cache
 from slite_api import SliteAPI
 from models import MeetingNote, FolderStructure
 
@@ -23,17 +26,15 @@ class NoteManager:
     """
     
     def __init__(self, api_key: str):
-        """
-        Initialize the note manager with API credentials.
-        
-        Args:
-            api_key (str): Slite API authentication key
-        """
+        """Initialize with optimized caching and async support"""
         self.api = SliteAPI(api_key)
+        self._title_pattern = re.compile(r'Meeting Notes:\s*(.*)')
+        self._note_cache = {}
         
+    @lru_cache(maxsize=100)
     def _extract_title(self, content: str) -> str:
         """
-        Extract title from note content.
+        Extract title from note content using regex for better performance.
         
         Args:
             content (str): The full content of the note
@@ -41,16 +42,12 @@ class NoteManager:
         Returns:
             str: Extracted title or "Untitled Meeting" if no title found
         """
-        lines = content.split('\n')
-        for line in lines:
-            line = line.strip()
-            if line.startswith('Meeting Notes:'):
-                return line[len('Meeting Notes:'):].strip()
-        return "Untitled Meeting"
+        match = self._title_pattern.search(content)
+        return match.group(1) if match else "Untitled Meeting"
     
-    def create_note(self, title: str, content: str) -> Dict:
+    async def create_note(self, title: str, content: str) -> Dict:
         """
-        Create a new note in Slite.
+        Create a new note asynchronously.
         
         Args:
             title (str): Title of the note
@@ -58,9 +55,6 @@ class NoteManager:
             
         Returns:
             Dict: API response containing the created note details
-            
-        Raises:
-            Exception: If note creation fails
         """
         try:
             logger.info(f"Creating note with title: {title}")
@@ -71,8 +65,9 @@ class NoteManager:
                 content=content
             )
             
-            # Create note in Slite
-            response = self.api.create_note(note)
+            # Create note and cache it
+            response = await self.api.create_note_async(note)
+            self._note_cache[response['id']] = response
             
             return response
             
@@ -80,7 +75,44 @@ class NoteManager:
             logger.error(f"Error creating note: {str(e)}")
             raise
     
-    def create_folder(self, name: str, description: Optional[str] = None) -> Dict:
+    async def get_note(self, note_id: str) -> Dict:
+        """
+        Get a note with caching.
+        
+        Args:
+            note_id (str): ID of the note to retrieve
+            
+        Returns:
+            Dict: Note data
+        """
+        if note_id in self._note_cache:
+            return self._note_cache[note_id]
+            
+        response = await self.api.get_note_async(note_id)
+        self._note_cache[note_id] = response
+        return response
+    
+    async def update_note(self, note_id: str, title: str, content: str) -> Dict:
+        """
+        Update a note asynchronously.
+        
+        Args:
+            note_id (str): ID of the note to update
+            title (str): New title
+            content (str): New content
+            
+        Returns:
+            Dict: Updated note data
+        """
+        try:
+            response = await self.api.update_note_async(note_id, title, content)
+            self._note_cache[note_id] = response
+            return response
+        except Exception as e:
+            logger.error(f"Error updating note: {str(e)}")
+            raise
+    
+    async def create_folder(self, name: str, description: Optional[str] = None) -> Dict:
         """
         Create a new folder in Slite.
         
@@ -100,7 +132,7 @@ class NoteManager:
                 description=description
             )
             
-            response = self.api.create_folder(folder)
+            response = await self.api.create_folder_async(folder)
             
             return response
             
@@ -108,37 +140,7 @@ class NoteManager:
             logger.error(f"Error creating folder: {str(e)}")
             raise
     
-    def update_note(self, note_id: str, title: Optional[str] = None, content: Optional[str] = None) -> Dict:
-        """
-        Update an existing note in Slite.
-        
-        Args:
-            note_id (str): ID of the note to update
-            title (Optional[str]): New title for the note
-            content (Optional[str]): New content for the note
-            
-        Returns:
-            Dict: API response containing the updated note details
-            
-        Raises:
-            Exception: If note update fails
-        """
-        try:
-            # Create note model with only the fields to update
-            note = MeetingNote(
-                title=title if title else "",
-                content=content if content else ""
-            )
-            
-            response = self.api.update_note(note_id, note)
-            
-            return response
-            
-        except Exception as e:
-            logger.error(f"Error updating note: {str(e)}")
-            raise
-    
-    def search_notes(self, query: str) -> List[Dict]:
+    async def search_notes(self, query: str) -> List[Dict]:
         """
         Search for notes in Slite.
         
@@ -152,14 +154,14 @@ class NoteManager:
             Exception: If search operation fails
         """
         try:
-            response = self.api.search_notes(query)
+            response = await self.api.search_notes_async(query)
             return response
             
         except Exception as e:
             logger.error(f"Error searching notes: {str(e)}")
             raise
     
-    def delete_note(self, note_id: str) -> Dict:
+    async def delete_note(self, note_id: str) -> Dict:
         """
         Delete a note from Slite.
         
@@ -173,7 +175,8 @@ class NoteManager:
             Exception: If note deletion fails
         """
         try:
-            response = self.api.delete_note(note_id)
+            response = await self.api.delete_note_async(note_id)
+            del self._note_cache[note_id]
             return response
             
         except Exception as e:

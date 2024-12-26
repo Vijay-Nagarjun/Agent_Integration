@@ -289,11 +289,14 @@ def demo_folder_operations(slite: SliteAPI):
         # Create a document in the folder
         notes_data = read_meeting_notes()
         
+        # Get the first note from the list, or create an empty one if list is empty
+        current_note = notes_data[0] if notes_data else {'title': 'Untitled Meeting', 'content': []}
+        
         # Format the current date for the document title
         current_date = datetime.now().strftime('%Y-%m-%d')
-        doc_title = f"{current_date} - {notes_data.get('title', 'Untitled Meeting')}"
+        doc_title = f"{current_date} - {current_note.get('title', 'Untitled Meeting')}"
         
-        markdown_content = slite.format_meeting_notes_markdown(notes_data)
+        markdown_content = slite.format_meeting_notes_markdown(current_note)
         doc = slite.create_document(
             title=doc_title,
             markdown_content=markdown_content,

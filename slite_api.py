@@ -11,6 +11,9 @@ import logging
 from typing import Dict, Optional, List, Callable
 from datetime import datetime
 import json
+from functools import lru_cache
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 # Configure module-level logger
 logger = logging.getLogger(__name__)
@@ -98,19 +101,31 @@ class SliteAPI:
     Provides methods for creating, updating, and managing documents and folders.
     """
     
-    def __init__(self, api_key: str):
+    def __init__(self, api_key: str, cache_ttl: int = 300):
         """
-        Initialize the Slite API client
+        Initialize the Slite API client with caching and connection pooling
+        
         Args:
-            api_key: Slite API authentication key
+            api_key (str): API authentication key
+            cache_ttl (int): Cache time-to-live in seconds (default: 5 minutes)
         """
         self.api_key = api_key
         self.base_url = "https://api.slite.com"
-        self.headers = {
+        self.session = requests.Session()
+        
+        # Configure connection pooling
+        retries = Retry(
+            total=3,
+            backoff_factor=0.3,
+            status_forcelist=[500, 502, 503, 504]
+        )
+        self.session.mount('https://', HTTPAdapter(max_retries=retries, pool_connections=10, pool_maxsize=10))
+        self.session.headers.update({
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json"
-        }
+        })
         self.events = SliteEventHandler()
+        self.cache_ttl = cache_ttl
 
     def add_metadata(self, data: Dict) -> Dict:
         """
@@ -247,6 +262,21 @@ class SliteAPI:
             "content": doc_content
         }
 
+    @lru_cache(maxsize=100)
+    def get_note(self, note_id: str) -> Dict:
+        """
+        Get note by ID with caching
+        
+        Args:
+            note_id: Note ID
+            
+        Returns:
+            Dict containing note data
+        """
+        response = self.session.get(f"{self.base_url}/v1/notes/{note_id}")
+        response.raise_for_status()
+        return response.json()
+
     def create_folder(self, name: str, description: str = "") -> Dict:
         """
         Create a new folder in Slite by creating a special note
@@ -277,9 +307,8 @@ This is a folder for organizing content.
             # Add metadata
             data = self.add_metadata(data)
             
-            response = requests.post(
+            response = self.session.post(
                 endpoint,
-                headers=self.headers,
                 json=data
             )
             
@@ -326,9 +355,8 @@ This is a folder for organizing content.
             # Add metadata
             data = self.add_metadata(data)
             
-            response = requests.post(
+            response = self.session.post(
                 endpoint,
-                headers=self.headers,
                 json=data
             )
             
@@ -347,42 +375,43 @@ This is a folder for organizing content.
             logger.error(f"Error creating document: {str(e)}")
             raise
 
-    def format_meeting_notes_markdown(self, notes_data: dict) -> str:
+    def format_meeting_notes_markdown(self, note_data: Dict) -> str:
         """
-        Format meeting notes as markdown
+        Format meeting notes data into markdown content
+        
         Args:
-            notes_data: Dictionary containing meeting notes data
-        Returns:
-            Markdown string representing the meeting notes
-        """
-        markdown = []
-        
-        # Add metadata
-        metadata = notes_data.get("metadata", {})
-        markdown.append("# Meeting Details\n")
-        markdown.append(f"**Date:** {metadata.get('date', 'N/A')}")
-        markdown.append(f"**Time:** {metadata.get('time', 'N/A')}")
-        markdown.append(f"**Attendees:** {metadata.get('attendees_count', 0)} attendees")
-        markdown.append(f"**Facilitator:** {metadata.get('facilitator', 'N/A')}\n")
-        
-        # Add sections
-        for section in notes_data.get("sections", []):
-            markdown.append(f"# {section.get('title', 'Untitled Section')}")
+            note_data: Dictionary containing note data with title, metadata, and content
             
-            for item in section.get("content", []):
-                if item.get("subtitle"):
-                    markdown.append(f"## {item['subtitle']}")
-                
-                details = item.get("details", "")
-                if isinstance(details, list):
-                    for detail in details:
-                        markdown.append(f"- {detail}")
-                else:
-                    markdown.append(details)
-                
-            markdown.append("")  # Add empty line between sections
-        
-        return "\n".join(markdown)
+        Returns:
+            str: Formatted markdown content
+        """
+        try:
+            markdown_lines = []
+            
+            # Add title
+            markdown_lines.append(f"# {note_data.get('title', 'Untitled Meeting')}\n")
+            
+            # Add metadata section
+            metadata = note_data.get('metadata', {})
+            if metadata:
+                markdown_lines.append("## Meeting Details\n")
+                if 'date' in metadata:
+                    markdown_lines.append(f"- Date: {metadata['date']}")
+                if 'participants' in metadata:
+                    participants = ', '.join(metadata['participants'])
+                    markdown_lines.append(f"- Participants: {participants}")
+                markdown_lines.append("\n")
+            
+            # Add content
+            markdown_lines.append("## Notes\n")
+            for line in note_data.get('content', []):
+                markdown_lines.append(line)
+            
+            return '\n'.join(markdown_lines)
+            
+        except Exception as e:
+            logger.error(f"Error formatting meeting notes: {str(e)}")
+            raise
 
     def create_note(self, title: str, content: str) -> Dict:
         """
@@ -407,9 +436,8 @@ This is a folder for organizing content.
             logger.debug(f"Creating note with title: {title}")
             logger.debug(f"Content structure: {content}")
             
-            response = requests.post(
+            response = self.session.post(
                 endpoint,
-                headers=self.headers,
                 json=data
             )
             
@@ -450,9 +478,8 @@ This is a folder for organizing content.
             }
             
             logger.debug(f"Updating note {note_id}")
-            response = requests.patch(
+            response = self.session.patch(
                 endpoint,
-                headers=self.headers,
                 json=data
             )
             
@@ -470,85 +497,6 @@ This is a folder for organizing content.
                 
         except requests.exceptions.RequestException as e:
             logger.error(f"Error updating note: {str(e)}")
-            raise Exception(f"Network error: {str(e)}")
-
-    def get_note(self, note_id: str) -> Dict:
-        """
-        Get a note from Slite
-        Args:
-            note_id: ID of the note to retrieve
-        Returns:
-            Dictionary containing the note's information
-        """
-        try:
-            endpoint = f"{self.base_url}/v1/notes/{note_id}"
-            response = requests.get(endpoint, headers=self.headers)
-            
-            if response.status_code == 200:
-                return response.json()
-            elif response.status_code == 429:
-                raise Exception("Rate limit exceeded")
-            elif response.status_code == 401:
-                raise Exception("Invalid API key")
-            elif response.status_code == 404:
-                raise Exception(f"Note {note_id} not found")
-            else:
-                raise Exception(f"Error getting note: {response.text}")
-                
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Error getting note: {str(e)}")
-            raise Exception(f"Network error: {str(e)}")
-
-    def search_notes(self, query: str) -> List[Dict]:
-        """
-        Search for notes in Slite
-        Args:
-            query: Search query to use
-        Returns:
-            List of dictionaries containing the search results
-        """
-        try:
-            endpoint = f"{self.base_url}/v1/notes/search"
-            response = requests.get(endpoint, headers=self.headers, params={"query": query})
-            
-            if response.status_code == 200:
-                return response.json()
-            elif response.status_code == 429:
-                raise Exception("Rate limit exceeded")
-            elif response.status_code == 401:
-                raise Exception("Invalid API key")
-            else:
-                raise Exception(f"Error searching notes: {response.text}")
-                
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Error searching notes: {str(e)}")
-            raise Exception(f"Network error: {str(e)}")
-
-    def delete_note(self, note_id: str) -> Dict:
-        """
-        Delete a note from Slite
-        Args:
-            note_id: ID of the note to delete
-        Returns:
-            Dictionary containing the deletion result
-        """
-        try:
-            endpoint = f"{self.base_url}/v1/notes/{note_id}"
-            response = requests.delete(endpoint, headers=self.headers)
-            
-            if response.status_code == 204:
-                return {"status": "success", "message": f"Note {note_id} deleted successfully"}
-            elif response.status_code == 429:
-                raise Exception("Rate limit exceeded")
-            elif response.status_code == 401:
-                raise Exception("Invalid API key")
-            elif response.status_code == 404:
-                raise Exception(f"Note {note_id} not found")
-            else:
-                raise Exception(f"Error deleting note: {response.text}")
-                
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Error deleting note: {str(e)}")
             raise Exception(f"Network error: {str(e)}")
 
     def update_folder(self, folder_id: str, name: str, description: str = "") -> Dict:
@@ -582,9 +530,8 @@ This is a folder for organizing content.
             # Add metadata
             data = self.add_metadata(data)
             
-            response = requests.put(
+            response = self.session.put(
                 endpoint,
-                headers=self.headers,
                 json=data
             )
             
@@ -618,7 +565,7 @@ This is a folder for organizing content.
         """
         try:
             endpoint = f"{self.base_url}/v1/notes/{folder_id}"
-            response = requests.delete(endpoint, headers=self.headers)
+            response = self.session.delete(endpoint)
             
             if response.status_code == 204:
                 return {"status": "success", "message": f"Folder {folder_id} deleted successfully"}
@@ -659,9 +606,8 @@ This is a folder for organizing content.
             # Add metadata
             data = self.add_metadata(data)
             
-            response = requests.put(
+            response = self.session.put(
                 endpoint,
-                headers=self.headers,
                 json=data
             )
             
@@ -690,7 +636,7 @@ This is a folder for organizing content.
         """
         try:
             endpoint = f"{self.base_url}/v1/notes/{doc_id}"
-            response = requests.delete(endpoint, headers=self.headers)
+            response = self.session.delete(endpoint)
             
             if response.status_code == 204:
                 return {"status": "success", "message": f"Document {doc_id} deleted successfully"}
@@ -705,6 +651,31 @@ This is a folder for organizing content.
                 
         except requests.exceptions.RequestException as e:
             logger.error(f"Error deleting document: {str(e)}")
+            raise Exception(f"Network error: {str(e)}")
+
+    def search_notes(self, query: str) -> List[Dict]:
+        """
+        Search for notes in Slite
+        Args:
+            query: Search query to use
+        Returns:
+            List of dictionaries containing the search results
+        """
+        try:
+            endpoint = f"{self.base_url}/v1/notes/search"
+            response = self.session.get(endpoint, params={"query": query})
+            
+            if response.status_code == 200:
+                return response.json()
+            elif response.status_code == 429:
+                raise Exception("Rate limit exceeded")
+            elif response.status_code == 401:
+                raise Exception("Invalid API key")
+            else:
+                raise Exception(f"Error searching notes: {response.text}")
+                
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Error searching notes: {str(e)}")
             raise Exception(f"Network error: {str(e)}")
 
 if __name__ == "__main__":
