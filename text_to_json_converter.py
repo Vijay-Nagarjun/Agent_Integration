@@ -208,50 +208,74 @@ class TextToJsonConverter:
         file_hash = self._get_file_hash(file_path)
         return self._cache_dir / f"{Path(file_path).stem}_{file_hash[:8]}.json"
         
-    def _parse_meeting_notes(self, content: str) -> List[Dict]:
-        """Parse meeting notes content into structured format"""
-        notes = []
-        current_note = {}
+    def _normalize_text(self, text: str) -> str:
+        """
+        Normalize text by converting special characters to their standard ASCII equivalents
+        """
+        # Debug: Print the hex values of each character in the text
+        for char in text:
+            if ord(char) > 127:  # Only print non-ASCII characters
+                logger.debug(f"Found special character: {char} (hex: {hex(ord(char))})")
         
-        for line in content.split('\n'):
-            line = line.strip()
-            
-            if line.startswith('Meeting Notes:'):
-                if current_note:
-                    notes.append(current_note)
-                current_note = {
-                    'title': line[len('Meeting Notes:'):].strip(),
-                    'content': [],
-                    'metadata': {}
-                }
-            elif line.startswith('Date:') and current_note:
-                try:
-                    date_str = line[len('Date:'):].strip()
-                    current_note['metadata']['date'] = datetime.strptime(
-                        date_str, '%Y-%m-%d'
-                    ).isoformat()
-                except ValueError:
-                    logger.warning(f"Invalid date format: {date_str}")
-                    current_note['metadata']['date'] = None
-            elif line.startswith('Participants:') and current_note:
-                participants = line[len('Participants:'):].strip()
-                current_note['metadata']['participants'] = [
-                    p.strip() for p in participants.split(',')
-                ]
-            elif line and current_note:
-                current_note['content'].append(line)
-                
-        if current_note:
-            notes.append(current_note)
-            
-        return notes
+        # More comprehensive character mapping
+        char_map = {
+            '\u2013': '-',  # en-dash
+            '\u2014': '-',  # em-dash
+            '\u2015': '-',  # horizontal bar
+            '\u2212': '-',  # minus sign
+            '\u2010': '-',  # hyphen
+            '\u2011': '-',  # non-breaking hyphen
+            '\u2012': '-',  # figure dash
+            '\u2043': '-',  # hyphen bullet
+            '\u002D': '-',  # hyphen-minus (standard ASCII hyphen)
+            '\u00AD': '-',  # soft hyphen
+            '\u2212': '-',  # minus sign
+            '\u2796': '-',  # heavy minus sign
+            # Add more variations of dashes
+            '–': '-',       # en-dash (direct character)
+            '—': '-',       # em-dash (direct character)
+            '―': '-',       # horizontal bar (direct character)
+            '‒': '-',       # figure dash (direct character)
+            '‐': '-',       # hyphen (direct character)
+            '‑': '-',       # non-breaking hyphen (direct character)
+            # Other special characters
+            '"': '"',       # smart quote
+            '"': '"',       # smart quote
+            ''': "'",       # smart apostrophe
+            ''': "'",       # smart apostrophe
+            '•': '*',       # bullet
+            '…': '...',     # ellipsis
+            '\u00a0': ' ',  # non-breaking space
+            '\u200b': '',   # zero-width space
+            '\u2022': '*',  # bullet point
+            '\u2026': '...', # horizontal ellipsis
+            '\u2028': '\n', # line separator
+            '\u2029': '\n\n', # paragraph separator
+        }
         
+        # First pass: normalize using explicit unicode values
+        for special, normal in char_map.items():
+            if special in text:
+                logger.debug(f"Replacing character: {special} (hex: {hex(ord(special))})")
+                text = text.replace(special, normal)
+        
+        # Second pass: handle any remaining special dashes by their unicode value
+        normalized = ''
+        for char in text:
+            if 0x2010 <= ord(char) <= 0x2015:  # Range of Unicode dashes
+                logger.debug(f"Converting dash character: {char} (hex: {hex(ord(char))})")
+                normalized += '-'
+            else:
+                normalized += char
+        
+        return normalized
+
     def convert_notes_to_json(
-        self,
-        input_file: str,
-        output_file: str,
-        force_update: bool = False
-    ) -> None:
+            self,
+            input_file: str,
+            output_file: str,
+            force_update: bool = False
+        ):
         """
         Convert meeting notes from text to JSON format with caching
         
@@ -261,41 +285,106 @@ class TextToJsonConverter:
             force_update: Force update even if cache exists
         """
         try:
-            cache_path = self._get_cache_path(input_file)
+            # Set logging to INFO level to reduce debug messages
+            logging.basicConfig(
+                level=logging.INFO,
+                format='%(message)s'  # Only show the message without debug info
+            )
             
-            # Check if cached version exists and is up to date
-            if not force_update and cache_path.exists():
-                logger.info("Using cached conversion")
-                with open(cache_path, 'rb') as cache_file:
-                    with open(output_file, 'wb') as out_file:
-                        # Use buffered copy
-                        while True:
-                            buf = cache_file.read(self.buffer_size)
-                            if not buf:
-                                break
-                            out_file.write(buf)
-                return
-                
-            # Read and parse input file
-            with open(input_file, 'r', buffering=self.buffer_size) as f:
+            logger.info(f"Converting {input_file} to JSON format...")
+            
+            # Read the input file with UTF-8 encoding
+            with open(input_file, 'r', encoding='utf-8') as f:
                 content = f.read()
                 
-            notes = self._parse_meeting_notes(content)
+            # Pre-process content to handle special characters
+            content = content.encode('utf-8').decode('utf-8')
             
-            # Write to both cache and output
-            json_content = json.dumps(notes, indent=2)
+            # Replace problematic characters directly
+            content = content.replace('\u2013', '-')  # en-dash
+            content = content.replace('\u2014', '-')  # em-dash
+            content = content.replace('–', '-')       # en-dash (direct)
+            content = content.replace('—', '-')       # em-dash (direct)
             
-            with open(cache_path, 'w') as cache_file:
-                cache_file.write(json_content)
+            # Parse the content
+            json_content = self._parse_meeting_notes(content)
+            
+            # Write to output file with UTF-8 encoding, ensuring proper character handling
+            with open(output_file, 'w', encoding='utf-8', newline='\n') as f:
+                json.dump(json_content, f, indent=2, ensure_ascii=False)
                 
-            with open(output_file, 'w') as out_file:
-                out_file.write(json_content)
-                
-            logger.info(f"Successfully converted {input_file} to {output_file}")
+            logger.info(f"Successfully converted to {output_file}")
+            return json_content
             
         except Exception as e:
-            logger.error(f"Error converting notes: {str(e)}")
+            logger.error(f"Error converting notes to JSON: {str(e)}")
             raise
+
+    def _parse_meeting_notes(self, content: str) -> Dict:
+        """Parse meeting notes content into structured format"""
+        # Normalize the entire content first
+        content = self._normalize_text(content)
+        
+        # Split content into lines and process
+        lines = content.strip().split('\n')
+        
+        # Initialize structure
+        structure = {
+            "timestamp": datetime.now().timestamp(),
+            "metadata": {},
+            "sections": []
+        }
+        
+        # Extract metadata
+        metadata = {}
+        attendees = []
+        current_section = None
+        in_attendees = False
+        
+        for line in lines:
+            # Normalize each line individually as well
+            line = self._normalize_text(line.strip())
+            if not line or line == "---":
+                continue
+                
+            if "**Date**:" in line:
+                metadata["date"] = line.split(":", 1)[1].strip()
+            elif "**Time**:" in line:
+                time_str = line.split(":", 1)[1].strip()
+                metadata["time"] = time_str
+            elif "**Location**:" in line:
+                metadata["location"] = line.split(":", 1)[1].strip()
+            elif "**Attendees**:" in line:
+                in_attendees = True
+            elif in_attendees and line.startswith("-"):
+                attendees.append(line[1:].strip())
+            elif line.startswith("**") and not line.startswith("**Attendees"):
+                in_attendees = False
+                
+                # Check if this is a new section
+                if line.endswith("**"):
+                    if current_section:
+                        structure["sections"].append(current_section)
+                    current_section = {
+                        "title": line.strip("*").strip(),
+                        "points": []
+                    }
+            elif current_section and line.startswith("-"):
+                # Add point to current section
+                point = line[1:].strip()
+                current_section["points"].append(point)
+            elif "Next Meeting:" in line:
+                next_meeting = line.split(":", 1)[1].strip()
+                metadata["next_meeting"] = next_meeting
+                
+        # Add the last section if exists
+        if current_section:
+            structure["sections"].append(current_section)
+            
+        metadata["attendees"] = attendees
+        structure["metadata"] = metadata
+        
+        return structure
 
 def convert_notes_to_json(input_file: str, output_file: str) -> None:
     """
@@ -330,4 +419,7 @@ def convert_notes_to_json_original(input_file: str, output_file: str) -> None:
 if __name__ == "__main__":
     input_file = 'meeting_notes.txt'
     output_file = 'meeting_notes.json'
-    convert_notes_to_json(input_file, output_file)
+    
+    # Force update to see debug output
+    converter = TextToJsonConverter()
+    converter.convert_notes_to_json(input_file, output_file, force_update=True)
