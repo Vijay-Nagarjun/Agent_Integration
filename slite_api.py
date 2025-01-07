@@ -6,16 +6,17 @@ allowing for creation, updating, and management of documents and folders.
 It includes event handling capabilities for various Slite operations.
 """
 
-import requests
+import aiohttp
+import asyncio
 import logging
 from typing import Dict, Optional, List, Callable
 from datetime import datetime
 import json
 from functools import lru_cache
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
+from concurrent.futures import ThreadPoolExecutor
+import backoff
+import socket
 
-# Configure module-level logger
 logger = logging.getLogger(__name__)
 
 class SliteEventHandler:
@@ -49,7 +50,7 @@ class SliteEventHandler:
         
     def trigger_folder_created(self, folder_data: Dict):
         """
-        Trigger all registered folder creation handlers
+        Trigger all registered folder creation event handlers
         Args:
             folder_data: Dictionary containing folder information
         """
@@ -58,10 +59,10 @@ class SliteEventHandler:
                 handler(folder_data)
             except Exception as e:
                 logger.error(f"Error in folder created handler: {str(e)}")
-                
+
     def trigger_folder_updated(self, folder_data: Dict):
         """
-        Trigger all registered folder update handlers
+        Trigger all registered folder update event handlers
         Args:
             folder_data: Dictionary containing folder information
         """
@@ -70,30 +71,67 @@ class SliteEventHandler:
                 handler(folder_data)
             except Exception as e:
                 logger.error(f"Error in folder updated handler: {str(e)}")
-                
-    def trigger_document_created(self, document_data: Dict):
+
+    def trigger_document_created(self, doc_data: Dict):
         """
-        Trigger all registered document creation handlers
+        Trigger all registered document creation event handlers
         Args:
-            document_data: Dictionary containing document information
+            doc_data: Dictionary containing document information
         """
         for handler in self.document_created_handlers:
             try:
-                handler(document_data)
+                handler(doc_data)
             except Exception as e:
                 logger.error(f"Error in document created handler: {str(e)}")
-                
-    def trigger_document_updated(self, document_data: Dict):
+
+    def trigger_document_updated(self, doc_data: Dict):
         """
-        Trigger all registered document update handlers
+        Trigger all registered document update event handlers
         Args:
-            document_data: Dictionary containing document information
+            doc_data: Dictionary containing document information
         """
         for handler in self.document_updated_handlers:
             try:
-                handler(document_data)
+                handler(doc_data)
             except Exception as e:
                 logger.error(f"Error in document updated handler: {str(e)}")
+
+class BatchProcessor:
+    """Handle batch operations for API requests"""
+    
+    def __init__(self, batch_size: int = 10, max_concurrent: int = 5):
+        self.batch_size = batch_size
+        self.max_concurrent = max_concurrent
+        self.queue = asyncio.Queue()
+        self.semaphore = asyncio.Semaphore(max_concurrent)
+        
+    async def add_item(self, item: Dict):
+        await self.queue.put(item)
+        
+    async def process_batch(self, processor_func: Callable) -> List[Dict]:
+        """Process items in batches"""
+        batch = []
+        results = []
+        
+        while not self.queue.empty():
+            try:
+                item = self.queue.get_nowait()
+                batch.append(item)
+                
+                if len(batch) >= self.batch_size:
+                    async with self.semaphore:
+                        batch_results = await processor_func(batch)
+                        results.extend(batch_results)
+                        batch = []
+            except asyncio.QueueEmpty:
+                break
+        
+        if batch:
+            async with self.semaphore:
+                batch_results = await processor_func(batch)
+                results.extend(batch_results)
+        
+        return results
 
 class SliteAPI:
     """
@@ -101,281 +139,270 @@ class SliteAPI:
     Provides methods for creating, updating, and managing documents and folders.
     """
     
-    def __init__(self, api_key: str, cache_ttl: int = 300):
-        """
-        Initialize the Slite API client with caching and connection pooling
-        
-        Args:
-            api_key (str): API authentication key
-            cache_ttl (int): Cache time-to-live in seconds (default: 5 minutes)
-        """
+    def __init__(self, api_key: str):
+        """Initialize the Slite API client"""
         self.api_key = api_key
-        self.base_url = "https://api.slite.com"
-        self.session = requests.Session()
-        
-        # Configure connection pooling
-        retries = Retry(
-            total=3,
-            backoff_factor=0.3,
-            status_forcelist=[500, 502, 503, 504]
-        )
-        self.session.mount('https://', HTTPAdapter(max_retries=retries, pool_connections=10, pool_maxsize=10))
-        self.session.headers.update({
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json"
-        })
+        self.base_url = "https://api.slite.com"  # Base URL for Slite API
+        self.session = None
         self.events = SliteEventHandler()
-        self.cache_ttl = cache_ttl
-
-    def add_metadata(self, data: Dict) -> Dict:
-        """
-        Add metadata to the data dictionary
-        Args:
-            data: Dictionary to add metadata to
-        Returns:
-            Dictionary with added metadata
-        """
-        if "metadata" not in data:
-            data["metadata"] = {}
-            
-        data["metadata"].update({
-            "last_updated": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "updated_by": "Slite Integration Agent"
-        })
-        return data
-
-    def _convert_text_to_prosemirror_node(self, text: str) -> Dict:
-        """
-        Convert a text string to a ProseMirror text node
-        Args:
-            text: Text string to convert
-        Returns:
-            Dictionary representing the ProseMirror text node
-        """
-        return {
-            "type": "text",
-            "text": text
-        }
-
-    def _convert_to_prosemirror(self, content: str) -> Dict:
-        """
-        Convert content to ProseMirror format
-        Args:
-            content: Content string to convert
-        Returns:
-            Dictionary representing the ProseMirror content
-        """
-        lines = content.split('\n')
-        doc_content = []
+        self._workspace_id = None
         
-        current_list = None
-        current_section = None
-        current_paragraph = None
-        
-        for line in lines:
-            line = line.rstrip()
-            
-            # Skip empty lines
-            if not line:
-                if current_list:
-                    doc_content.append(current_list)
-                    current_list = None
-                if current_paragraph:
-                    doc_content.append(current_paragraph)
-                doc_content.append({
-                    "type": "paragraph",
-                    "content": [{"type": "text", "text": ""}]
-                })
-                continue
-            
-            # Handle bullet points
-            if line.strip().startswith('- '):
-                text = line.strip()[2:]
-                if current_list is None:
-                    current_list = {
-                        "type": "bulletList",
-                        "content": []
-                    }
-                list_item = {
-                    "type": "listItem",
-                    "content": [{
-                        "type": "paragraph",
-                        "content": [{"type": "text", "text": text}]
-                    }]
-                }
-                current_list["content"].append(list_item)
-                
-            # Handle section headers
-            elif line.startswith('Meeting Notes:') or line.startswith('Date:') or line.startswith('Time:') or line.startswith('Attendees:') or line.startswith('Facilitator:'):
-                if current_list:
-                    doc_content.append(current_list)
-                    current_list = None
-                if current_paragraph:
-                    doc_content.append(current_paragraph)
-                    current_paragraph = None
-                    
-                doc_content.append({
-                    "type": "heading",
-                    "attrs": {"level": 2},
-                    "content": [{"type": "text", "text": line}]
-                })
-                
-            # Handle numbered sections
-            elif line[0].isdigit() and line[1] == '.':
-                if current_list:
-                    doc_content.append(current_list)
-                    current_list = None
-                if current_paragraph:
-                    doc_content.append(current_paragraph)
-                    current_paragraph = None
-                    
-                doc_content.append({
-                    "type": "heading",
-                    "attrs": {"level": 2},
-                    "content": [{"type": "text", "text": line}]
-                })
-                
-            # Regular text
-            else:
-                if current_list:
-                    doc_content.append(current_list)
-                    current_list = None
-                    
-                if not current_paragraph:
-                    current_paragraph = {
-                        "type": "paragraph",
-                        "content": []
-                    }
-                current_paragraph["content"].append({
-                    "type": "text", 
-                    "text": line
-                })
-        
-        # Add any remaining content
-        if current_list:
-            doc_content.append(current_list)
-        if current_paragraph:
-            doc_content.append(current_paragraph)
-            
-        return {
-            "type": "doc",
-            "content": doc_content
-        }
+    async def __aenter__(self):
+        """Async context manager entry"""
+        # Initialize session with auth header
+        self.session = aiohttp.ClientSession(
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+                "Accept": "application/json"
+            }
+        )
+        return self
 
-    @lru_cache(maxsize=100)
-    def get_note(self, note_id: str) -> Dict:
-        """
-        Get note by ID with caching
-        
-        Args:
-            note_id: Note ID
-            
-        Returns:
-            Dict containing note data
-        """
-        response = self.session.get(f"{self.base_url}/v1/notes/{note_id}")
-        response.raise_for_status()
-        return response.json()
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        """Async context manager exit"""
+        if self.session:
+            await self.session.close()
 
-    def create_folder(self, name: str, description: str = "") -> Dict:
-        """
-        Create a new folder in Slite by creating a special note
-        Args:
-            name: Name of the folder to create
-            description: Optional description for the folder
-        Returns:
-            Dictionary containing the created folder's information
-        """
+    @backoff.on_exception(backoff.expo, 
+                          (aiohttp.ClientError, Exception),
+                          max_tries=3,
+                          max_time=10)
+    async def _make_request(self, method: str, endpoint: str, **kwargs) -> Dict:
+        """Make an HTTP request to the Slite API with retry logic"""
+        if not self.session:
+            raise Exception("Session not initialized. Use async with context manager.")
+            
+        url = f"{self.base_url}{endpoint}"
+        
         try:
-            endpoint = f"{self.base_url}/v1/notes"
-            
-            # Create a folder using note with special format
-            markdown_content = f"""# {name}
+            async with self.session.request(method, url, **kwargs) as response:
+                if response.status == 404:
+                    logger.error(f"Resource not found: {endpoint}")
+                    raise Exception(f"Resource not found: {endpoint}")
+                elif response.status == 429:
+                    logger.error("Rate limit exceeded")
+                    raise Exception("Rate limit exceeded")
+                elif response.status == 503:
+                    logger.error("Service temporarily unavailable. Retrying...")
+                    raise Exception("Service temporarily unavailable")
+                elif response.status >= 400:
+                    error_text = await response.text()
+                    logger.error(f"Request failed: Error {response.status}: {error_text}")
+                    raise Exception(f"Request failed: {error_text}")
+                
+                # For DELETE requests that return 204, return empty dict
+                if method == "DELETE" and response.status == 204:
+                    return {}
+                    
+                # For all other requests, try to parse JSON
+                try:
+                    response_json = await response.json()
+                    return response_json
+                except aiohttp.ContentTypeError:
+                    # If no JSON and not a DELETE 204, that's an error
+                    if not (method == "DELETE" and response.status == 204):
+                        raise
+                    return {}
+                
+        except aiohttp.ClientError as e:
+            logger.error(f"Network error in API request: {str(e)}")
+            raise
+        except Exception as e:
+            logger.error(f"API request failed: {str(e)}")
+            raise
 
-{description}
-
----
-This is a folder for organizing content.
-"""
+    async def list_documents(self) -> List[Dict]:
+        """List all documents in Slite"""
+        try:
+            # Use search endpoint with empty query to get all documents
+            response = await self._make_request("GET", "/v1/search-notes", params={"type": "note"})
+            documents = []
+            if isinstance(response, dict):
+                documents = response.get('hits', [])
+            else:
+                documents = response if isinstance(response, list) else []
             
+            logger.info(f"Retrieved {len(documents)} documents")
+            return documents
+            
+        except Exception as e:
+            logger.error(f"Error listing documents: {str(e)}")
+            raise
+
+    async def list_folders(self) -> List[Dict]:
+        """List all available folders"""
+        try:
+            # Get all folders using search
+            response = await self._make_request("GET", "/v1/search-notes", params={"type": "folder"})
+            
+            # Extract folders from the response
+            folders = []
+            if isinstance(response, dict):
+                folders = response.get('hits', [])
+            else:
+                folders = response if isinstance(response, list) else []
+            
+            logger.info(f"Retrieved {len(folders)} folders")
+            return folders
+            
+        except Exception as e:
+            logger.error(f"Error listing folders: {str(e)}")
+            raise
+
+    async def create_folder(self, name: str, description: str = "") -> Dict:
+        """Create a new folder"""
+        try:
             data = {
                 "title": name,
-                "markdown": markdown_content,
+                "markdown": f"# {name}\n\n{description}\n\n---\nThis is a folder for organizing content.",
+                "type": "folder",
                 "isFolder": True
             }
             
-            # Add metadata
-            data = self.add_metadata(data)
+            response = await self._make_request("POST", "/v1/notes", json=data)
             
-            response = self.session.post(
-                endpoint,
-                json=data
-            )
-            
-            if response.status_code in [200, 201]:
-                result = response.json()
-                folder_data = {
-                    "id": result.get("id"),
-                    "name": name,
-                    "description": description,
-                    "url": result.get("url"),
-                    "metadata": data.get("metadata", {})
-                }
-                # Trigger folder created event
-                self.events.trigger_folder_created(folder_data)
-                return folder_data
-            else:
-                logger.error(f"Error creating folder: {response.text}")
-                response.raise_for_status()
+            # Ensure we have the folder ID
+            if not response.get('id'):
+                logger.warning("Created folder but ID not found in response")
                 
+            logger.info(f"Successfully created folder: {name}")
+            
+            # Trigger event handlers
+            self.events.trigger_folder_created(response)
+            
+            return response
+            
         except Exception as e:
             logger.error(f"Error creating folder: {str(e)}")
             raise
 
-    def create_document(self, title: str, markdown_content: str, folder_id: Optional[str] = None) -> Dict:
-        """
-        Create a new document in Slite
-        Args:
-            title: Title of the document to create
-            markdown_content: Markdown content of the document
-            folder_id: Optional ID of the folder to create the document in
-        Returns:
-            Dictionary containing the created document's information
-        """
+    async def delete_folder(self, folder_id: str) -> Dict:
+        """Delete a folder"""
         try:
-            endpoint = f"{self.base_url}/v1/notes"
+            response = await self._make_request("DELETE", f"/v1/notes/{folder_id}")
+            logger.info(f"Successfully deleted folder {folder_id}")
+            return response
+            
+        except Exception as e:
+            logger.error(f"Error deleting folder: {str(e)}")
+            raise
+
+    async def rename_folder(self, folder_id: str, new_name: str) -> Dict:
+        """Rename a folder"""
+        try:
+            data = {
+                "title": new_name
+            }
+            response = await self._make_request("PUT", f"/v1/notes/{folder_id}", json=data)
+            logger.info(f"Successfully renamed folder {folder_id} to '{new_name}'")
+            return response
+            
+        except Exception as e:
+            logger.error(f"Error renaming folder: {str(e)}")
+            raise
+
+    async def create_document(self, title: str, content: str, parent_note_id: str = None) -> Dict:
+        """Create a new document with optional parent note ID"""
+        try:
             data = {
                 "title": title,
-                "markdown": markdown_content
+                "markdown": content
             }
             
-            if folder_id:
-                data["parentNoteId"] = folder_id
-                
-            # Add metadata
-            data = self.add_metadata(data)
+            if parent_note_id:
+                data["parentNoteId"] = parent_note_id
             
-            response = self.session.post(
-                endpoint,
-                json=data
-            )
+            logger.info(f"Creating document '{title}' with content length {len(content)}")
+            if parent_note_id:
+                logger.info(f"Document will be created under parent {parent_note_id}")
             
-            if response.status_code in [200, 201]:
-                result = response.json()
-                # Add our metadata to the result
-                result["metadata"] = data.get("metadata", {})
-                # Trigger document created event
-                self.events.trigger_document_created(result)
-                return result
-            else:
-                logger.error(f"Error creating document: {response.text}")
-                response.raise_for_status()
-                
+            response = await self._make_request("POST", "/v1/notes", json=data)
+            
+            if not response:
+                raise Exception("No response received from create request")
+            
+            logger.info(f"Successfully created document {response.get('id', 'Unknown ID')}")
+            
+            # Trigger event handlers
+            self.events.trigger_document_created(response)
+            
+            return response
+            
         except Exception as e:
             logger.error(f"Error creating document: {str(e)}")
             raise
 
-    def format_meeting_notes_markdown(self, note_data: Dict) -> str:
+    async def get_document(self, doc_id: str) -> Dict:
+        """Get a document by ID"""
+        try:
+            response = await self._make_request("GET", f"/v1/notes/{doc_id}")
+            
+            content = response.get('content', '')
+            if isinstance(content, dict):
+                content = content.get('markdown', '')
+            elif isinstance(content, str):
+                content = content
+            else:
+                content = ''
+                
+            logger.info(f"Retrieved document content (first 100 chars): {content[:100]}")
+            logger.info(f"Content length: {len(content)} characters")
+            
+            return response
+            
+        except Exception as e:
+            logger.error(f"Error getting document: {str(e)}")
+            raise
+
+    async def update_document(self, doc_id: str, content: str, title: str = None) -> Dict:
+        """Update a document's content and optionally its title"""
+        try:
+            data = {
+                "markdown": content
+            }
+            
+            if title:
+                data["title"] = title
+            
+            response = await self._make_request("PUT", f"/v1/notes/{doc_id}", json=data)
+            
+            if not response:
+                raise Exception("No response received from update request")
+            
+            logger.info(f"Successfully updated document {doc_id}")
+            return response
+            
+        except Exception as e:
+            logger.error(f"Error updating document: {str(e)}")
+            raise
+
+    async def delete_document(self, doc_id: str) -> Dict:
+        """Delete a document"""
+        try:
+            response = await self._make_request("DELETE", f"/v1/notes/{doc_id}")
+            logger.info(f"Successfully deleted document {doc_id}")
+            return response
+            
+        except Exception as e:
+            logger.error(f"Error deleting document: {str(e)}")
+            raise
+
+    async def rename_document(self, doc_id: str, new_title: str) -> Dict:
+        """Rename a document"""
+        try:
+            data = {
+                "title": new_title
+            }
+            response = await self._make_request("PUT", f"/v1/notes/{doc_id}", json=data)
+            logger.info(f"Successfully renamed document {doc_id} to '{new_title}'")
+            return response
+            
+        except Exception as e:
+            logger.error(f"Error renaming document: {str(e)}")
+            raise
+
+    async def format_meeting_notes_markdown(self, note_data: Dict) -> str:
         """
         Format meeting notes data into markdown content
         
@@ -389,296 +416,63 @@ This is a folder for organizing content.
             markdown_lines = []
             
             # Add title
-            markdown_lines.append(f"# {note_data.get('title', 'Untitled Meeting')}\n")
+            markdown_lines.append("# Meeting Notes")
+            markdown_lines.append("")
             
             # Add metadata section
             metadata = note_data.get('metadata', {})
             if metadata:
-                markdown_lines.append("## Meeting Details\n")
-                if 'date' in metadata:
-                    markdown_lines.append(f"- Date: {metadata['date']}")
-                if 'participants' in metadata:
-                    participants = ', '.join(metadata['participants'])
-                    markdown_lines.append(f"- Participants: {participants}")
-                markdown_lines.append("\n")
+                markdown_lines.append("## 📅 Meeting Details")
+                markdown_lines.append("")
+                markdown_lines.append(f"**Date:** {metadata.get('date', 'N/A')}")
+                markdown_lines.append(f"**Time:** {metadata.get('time', 'N/A')}")
+                markdown_lines.append(f"**Location:** {metadata.get('location', 'N/A')}")
+                if 'attendees' in metadata:
+                    markdown_lines.append("**Attendees:**")
+                    for attendee in metadata['attendees']:
+                        markdown_lines.append(f"- {attendee}")
+                markdown_lines.append(f"**Next Meeting:** {metadata.get('next_meeting', 'N/A')}")
+                markdown_lines.append("")
             
-            # Add content
-            markdown_lines.append("## Notes\n")
-            for line in note_data.get('content', []):
-                markdown_lines.append(line)
+            # Add sections
+            sections = note_data.get('sections', [])
+            for section in sections:
+                title = section.get('title', '')
+                points = section.get('points', [])
+                
+                markdown_lines.append(f"## 📝 {title}")
+                markdown_lines.append("")
+                
+                for point in points:
+                    if isinstance(point, str):
+                        markdown_lines.append(f"- {point}")
+                    elif isinstance(point, dict):
+                        header = point.get('header', '')
+                        sub_points = point.get('sub_points', [])
+                        
+                        # Add header with proper formatting
+                        markdown_lines.append(f"### {header}")
+                        
+                        # Add sub-points if any
+                        for sub_point in sub_points:
+                            markdown_lines.append(f"- {sub_point}")
+                        
+                        markdown_lines.append("")
+                
+                markdown_lines.append("")  # Add extra line between sections
             
-            return '\n'.join(markdown_lines)
+            return "\n".join(markdown_lines)
             
         except Exception as e:
             logger.error(f"Error formatting meeting notes: {str(e)}")
             raise
 
-    def create_note(self, title: str, content: str) -> Dict:
-        """
-        Create a new note in Slite
-        Args:
-            title: Title of the note to create
-            content: Content of the note to create
-        Returns:
-            Dictionary containing the created note's information
-        """
-        try:
-            endpoint = f"{self.base_url}/v1/notes"
-            
-            # Convert content to ProseMirror format
-            content = self._convert_to_prosemirror(content)
-            
-            data = {
-                "title": title,
-                "content": content
-            }
-            
-            logger.debug(f"Creating note with title: {title}")
-            logger.debug(f"Content structure: {content}")
-            
-            response = self.session.post(
-                endpoint,
-                json=data
-            )
-            
-            if response.status_code in [200, 201]:
-                logger.info(f"Successfully created note with content")
-                return response.json()
-            elif response.status_code == 429:
-                raise Exception("Rate limit exceeded")
-            elif response.status_code == 401:
-                raise Exception("Invalid API key")
-            else:
-                logger.error(f"Error creating note: {response.text}")
-                raise Exception(f"Error creating note: {response.text}")
-                
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Error creating note: {str(e)}")
-            raise Exception(f"Network error: {str(e)}")
-
-    def update_note(self, note_id: str, title: str, content: str) -> Dict:
-        """
-        Update an existing note in Slite
-        Args:
-            note_id: ID of the note to update
-            title: New title of the note
-            content: New content of the note
-        Returns:
-            Dictionary containing the updated note's information
-        """
-        try:
-            endpoint = f"{self.base_url}/v1/notes/{note_id}"
-            
-            # Convert content to ProseMirror format
-            content = self._convert_to_prosemirror(content)
-            
-            data = {
-                "title": title,
-                "content": content
-            }
-            
-            logger.debug(f"Updating note {note_id}")
-            response = self.session.patch(
-                endpoint,
-                json=data
-            )
-            
-            if response.status_code == 200:
-                logger.info(f"Successfully updated note {note_id}")
-                return response.json()
-            elif response.status_code == 429:
-                raise Exception("Rate limit exceeded")
-            elif response.status_code == 401:
-                raise Exception("Invalid API key")
-            elif response.status_code == 404:
-                raise Exception(f"Note {note_id} not found")
-            else:
-                raise Exception(f"Error updating note: {response.text}")
-                
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Error updating note: {str(e)}")
-            raise Exception(f"Network error: {str(e)}")
-
-    def update_folder(self, folder_id: str, name: str, description: str = "") -> Dict:
-        """
-        Update an existing folder in Slite
-        Args:
-            folder_id: ID of the folder to update
-            name: New name of the folder
-            description: Optional new description of the folder
-        Returns:
-            Dictionary containing the updated folder's information
-        """
-        try:
-            endpoint = f"{self.base_url}/v1/notes/{folder_id}"
-            
-            # Update folder using note with special format
-            markdown_content = f"""# {name}
-
-{description}
-
----
-This is a folder for organizing content.
-"""
-            
-            data = {
-                "title": name,
-                "markdown": markdown_content,
-                "isFolder": True
-            }
-            
-            # Add metadata
-            data = self.add_metadata(data)
-            
-            response = self.session.put(
-                endpoint,
-                json=data
-            )
-            
-            if response.status_code in [200, 201]:
-                result = response.json()
-                folder_data = {
-                    "id": result.get("id"),
-                    "name": name,
-                    "description": description,
-                    "url": result.get("url"),
-                    "metadata": data.get("metadata", {})
-                }
-                # Trigger folder updated event
-                self.events.trigger_folder_updated(folder_data)
-                return folder_data
-            else:
-                logger.error(f"Error updating folder: {response.text}")
-                response.raise_for_status()
-                
-        except Exception as e:
-            logger.error(f"Error updating folder: {str(e)}")
-            raise
-
-    def delete_folder(self, folder_id: str) -> Dict:
-        """
-        Delete a folder from Slite
-        Args:
-            folder_id: ID of the folder to delete
-        Returns:
-            Dictionary containing the deletion result
-        """
-        try:
-            endpoint = f"{self.base_url}/v1/notes/{folder_id}"
-            response = self.session.delete(endpoint)
-            
-            if response.status_code == 204:
-                return {"status": "success", "message": f"Folder {folder_id} deleted successfully"}
-            elif response.status_code == 429:
-                raise Exception("Rate limit exceeded")
-            elif response.status_code == 401:
-                raise Exception("Invalid API key")
-            elif response.status_code == 404:
-                raise Exception(f"Folder {folder_id} not found")
-            else:
-                raise Exception(f"Error deleting folder: {response.text}")
-                
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Error deleting folder: {str(e)}")
-            raise Exception(f"Network error: {str(e)}")
-
-    def update_document(self, doc_id: str, title: str, markdown_content: str, folder_id: Optional[str] = None) -> Dict:
-        """
-        Update an existing document in Slite
-        Args:
-            doc_id: ID of the document to update
-            title: New title of the document
-            markdown_content: New markdown content of the document
-            folder_id: Optional ID of the folder to update the document in
-        Returns:
-            Dictionary containing the updated document's information
-        """
-        try:
-            endpoint = f"{self.base_url}/v1/notes/{doc_id}"
-            data = {
-                "title": title,
-                "markdown": markdown_content
-            }
-            
-            if folder_id:
-                data["parentNoteId"] = folder_id
-                
-            # Add metadata
-            data = self.add_metadata(data)
-            
-            response = self.session.put(
-                endpoint,
-                json=data
-            )
-            
-            if response.status_code in [200, 201]:
-                result = response.json()
-                # Add our metadata to the result
-                result["metadata"] = data.get("metadata", {})
-                # Trigger document updated event
-                self.events.trigger_document_updated(result)
-                return result
-            else:
-                logger.error(f"Error updating document: {response.text}")
-                response.raise_for_status()
-                
-        except Exception as e:
-            logger.error(f"Error updating document: {str(e)}")
-            raise
-
-    def delete_document(self, doc_id: str) -> Dict:
-        """
-        Delete a document from Slite
-        Args:
-            doc_id: ID of the document to delete
-        Returns:
-            Dictionary containing the deletion result
-        """
-        try:
-            endpoint = f"{self.base_url}/v1/notes/{doc_id}"
-            response = self.session.delete(endpoint)
-            
-            if response.status_code == 204:
-                return {"status": "success", "message": f"Document {doc_id} deleted successfully"}
-            elif response.status_code == 429:
-                raise Exception("Rate limit exceeded")
-            elif response.status_code == 401:
-                raise Exception("Invalid API key")
-            elif response.status_code == 404:
-                raise Exception(f"Document {doc_id} not found")
-            else:
-                raise Exception(f"Error deleting document: {response.text}")
-                
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Error deleting document: {str(e)}")
-            raise Exception(f"Network error: {str(e)}")
-
-    def search_notes(self, query: str) -> List[Dict]:
-        """
-        Search for notes in Slite
-        Args:
-            query: Search query to use
-        Returns:
-            List of dictionaries containing the search results
-        """
-        try:
-            endpoint = f"{self.base_url}/v1/notes/search"
-            response = self.session.get(endpoint, params={"query": query})
-            
-            if response.status_code == 200:
-                return response.json()
-            elif response.status_code == 429:
-                raise Exception("Rate limit exceeded")
-            elif response.status_code == 401:
-                raise Exception("Invalid API key")
-            else:
-                raise Exception(f"Error searching notes: {response.text}")
-                
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Error searching notes: {str(e)}")
-            raise Exception(f"Network error: {str(e)}")
-
 if __name__ == "__main__":
     # Test the API connection
-    slite = SliteAPI("your_api_key")
-    # Add test code here
+    async def main():
+        slite = SliteAPI("your_api_key")
+        async with slite:
+            # Add test code here
+            pass
+            
+    asyncio.run(main())

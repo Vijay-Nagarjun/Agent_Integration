@@ -7,27 +7,93 @@ from slite_api import SliteAPI
 from datetime import datetime, timedelta
 import sys
 import threading
-from text_to_json_converter import convert_notes_to_json
+import asyncio
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
+from functools import partial
+import queue
+from typing import Dict, List, Optional
+import signal
+from contextlib import contextmanager
 
-# Configure logging
+# Load environment variables at the start
+try:
+    load_dotenv(override=True)
+except Exception as e:
+    print(f"Error loading environment variables: {str(e)}")
+    sys.exit(1)
+
+# Configure logging with performance metrics
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(name)s - %(levelname)s - [%(threadName)s] - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
-def convert_text_to_json():
-    """
-    Convert meeting notes from text to JSON format before processing.
-    This function is automatically called before reading meeting notes to ensure
-    the JSON file is up to date with the latest text content.
-    """
+# Global thread pool for parallel operations
+thread_pool = ThreadPoolExecutor(max_workers=4)
+process_pool = ProcessPoolExecutor(max_workers=2)
+
+# Event queue for handling operations
+event_queue = queue.Queue()
+
+class PerformanceMetrics:
+    """Track and report performance metrics"""
+    
+    def __init__(self):
+        self.operation_times = {}
+        self.error_counts = {}
+        self._lock = threading.Lock()
+        
+    def record_operation(self, operation: str, duration: float):
+        with self._lock:
+            if operation not in self.operation_times:
+                self.operation_times[operation] = []
+            self.operation_times[operation].append(duration)
+            
+    def record_error(self, operation: str):
+        with self._lock:
+            self.error_counts[operation] = self.error_counts.get(operation, 0) + 1
+            
+    def get_metrics(self) -> Dict:
+        with self._lock:
+            metrics = {}
+            for op, times in self.operation_times.items():
+                metrics[op] = {
+                    'avg_time': sum(times) / len(times),
+                    'min_time': min(times),
+                    'max_time': max(times),
+                    'total_ops': len(times),
+                    'errors': self.error_counts.get(op, 0)
+                }
+            return metrics
+
+# Initialize performance metrics
+metrics = PerformanceMetrics()
+
+@contextmanager
+def measure_time(operation: str):
+    """Context manager to measure operation time"""
+    start_time = time.time()
     try:
-        convert_notes_to_json('meeting_notes.txt', 'meeting_notes.json')
-        logger.info("Successfully converted meeting notes from text to JSON")
-    except Exception as e:
-        logger.error(f"Error converting meeting notes: {str(e)}")
-        raise
+        yield
+    finally:
+        duration = time.time() - start_time
+        metrics.record_operation(operation, duration)
+
+async def process_notes_batch(notes: List[Dict], slite: SliteAPI) -> List[Dict]:
+    """Process a batch of notes in parallel"""
+    async def process_note(note: Dict) -> Dict:
+        try:
+            with measure_time('note_processing'):
+                # Add any note-specific processing here
+                return note
+        except Exception as e:
+            logger.error(f"Error processing note: {str(e)}")
+            metrics.record_error('note_processing')
+            return None
+    
+    tasks = [process_note(note) for note in notes]
+    return await asyncio.gather(*tasks)
 
 def read_meeting_notes():
     """
@@ -55,304 +121,660 @@ def read_meeting_notes():
         logger.error(f"Error reading meeting notes: {str(e)}")
         raise
 
-def on_folder_created(folder_data: dict):
-    """Handler for folder creation events"""
-    logger.info(f"Folder created event: {folder_data['name']}")
-    logger.info(f"Created by: {folder_data['metadata']['updated_by']}")
-    logger.info(f"Created at: {folder_data['metadata']['last_updated']}")
+def convert_text_to_json():
+    """
+    Convert meeting notes from text to JSON format before processing.
+    This function is automatically called before reading meeting notes to ensure
+    the JSON file is up to date with the latest text content.
+    """
+    try:
+        # Read the text file
+        with open('meeting_notes.txt', 'r') as f:
+            text_content = f.read()
+        
+        # Split content into sections
+        lines = text_content.splitlines()
+        formatted_content = []
+        current_section = None
+        current_points = []
+        metadata = {
+            'date': '',
+            'time': '',
+            'location': '',
+            'attendees': [],
+            'next_meeting': ''
+        }
 
-def on_folder_updated(folder_data: dict):
-    """Handler for folder update events"""
-    logger.info(f"Folder updated event: {folder_data['name']}")
-    logger.info(f"Updated by: {folder_data['metadata']['updated_by']}")
-    logger.info(f"Updated at: {folder_data['metadata']['last_updated']}")
+        for line in lines:
+            line = line.strip()
+            if not line or line == '---':
+                continue
+            
+            # Extract metadata
+            if line.startswith('**Date**:'):
+                metadata['date'] = line.replace('**Date**:', '').strip()
+            elif line.startswith('**Time**:'):
+                metadata['time'] = line.replace('**Time**:', '').strip()
+            elif line.startswith('**Location**:'):
+                metadata['location'] = line.replace('**Location**:', '').strip()
+            elif line.startswith('**Next Meeting**:'):
+                metadata['next_meeting'] = line.replace('**Next Meeting**:', '').strip()
+            elif line.startswith('**Attendees**:'):
+                # Start collecting attendees
+                continue
+            elif line.startswith('- ') and not current_section:
+                # These are attendees
+                attendee = line.replace('- ', '').strip()
+                metadata['attendees'].append(attendee)
+                
+            # Check for numbered sections (1., 2., etc.)
+            elif line.strip().startswith(('1.', '2.', '3.', '4.', '5.', '6.')):
+                if current_section and current_points:
+                    formatted_content.append({
+                        'title': current_section,
+                        'points': current_points
+                    })
+                current_section = line.split('**', 2)[1].strip()
+                current_points = []
+                
+            # Check for bullet points
+            elif line.lstrip().startswith('- ') and current_section:
+                point = line.lstrip('- ').strip()
+                if point:
+                    # Check if it's a sub-bullet point
+                    if line.startswith('     -'):
+                        # Add as a sub-point to the last main point
+                        if current_points and isinstance(current_points[-1], dict):
+                            current_points[-1]['sub_points'].append(point)
+                    else:
+                        # If the point starts with bold text, it's a header point
+                        if point.startswith('**'):
+                            current_points.append({
+                                'header': point,
+                                'sub_points': []
+                            })
+                        else:
+                            current_points.append(point)
 
-def on_document_created(doc_data: dict):
-    """Handler for document creation events"""
-    logger.info(f"Document created event: {doc_data['title']}")
-    logger.info(f"Created by: {doc_data['metadata']['updated_by']}")
-    logger.info(f"Created at: {doc_data['metadata']['last_updated']}")
+        # Add the last section
+        if current_section and current_points:
+            formatted_content.append({
+                'title': current_section,
+                'points': current_points
+            })
 
-def on_document_updated(doc_data: dict):
-    """Handler for document update events"""
-    logger.info(f"Document updated event: {doc_data['title']}")
-    logger.info(f"Updated by: {doc_data['metadata']['updated_by']}")
-    logger.info(f"Updated at: {doc_data['metadata']['last_updated']}")
+        # Add special sections if they exist
+        for line in lines:
+            if line.strip() == '**Decisions Made:**':
+                decisions_section = {
+                    'title': 'Decisions Made',
+                    'points': []
+                }
+                idx = lines.index(line)
+                while idx + 1 < len(lines) and not lines[idx + 1].strip() == '---':
+                    next_line = lines[idx + 1].strip()
+                    if next_line.startswith('- '):
+                        decisions_section['points'].append(next_line.lstrip('- ').strip())
+                    idx += 1
+                formatted_content.append(decisions_section)
+            elif line.strip() == '**Action Items:**':
+                actions_section = {
+                    'title': 'Action Items',
+                    'points': []
+                }
+                idx = lines.index(line)
+                while idx + 1 < len(lines) and not lines[idx + 1].strip() == '---':
+                    next_line = lines[idx + 1].strip()
+                    if next_line.startswith(('1.', '2.', '3.', '4.', '5.')):
+                        actions_section['points'].append(next_line.split('.', 1)[1].strip())
+                    idx += 1
+                formatted_content.append(actions_section)
 
-def display_menu():
+        # Convert to JSON structure
+        notes_data = {
+            'timestamp': time.time(),
+            'metadata': metadata,
+            'sections': formatted_content,
+            'format_version': '1.0'
+        }
+        
+        # Write to JSON file
+        with open('meeting_notes.json', 'w') as f:
+            json.dump(notes_data, f, indent=2)
+            
+        logger.info("Successfully converted meeting notes from text to JSON")
+        logger.info("Metadata:")
+        for key, value in metadata.items():
+            logger.info(f"  {key}: {value}")
+        logger.info("Formatted content:")
+        for section in formatted_content:
+            logger.info(f"Section: {section['title']}")
+            for point in section['points']:
+                if isinstance(point, dict):
+                    logger.info(f"  {point['header']}")
+                    for sub_point in point['sub_points']:
+                        logger.info(f"    - {sub_point}")
+                else:
+                    logger.info(f"  - {point}")
+            
+        return notes_data
+            
+    except Exception as e:
+        logger.error(f"Error converting meeting notes: {str(e)}")
+        raise
+
+class ResourceManager:
+    """Manage system resources and cleanup"""
+    
+    def __init__(self):
+        self.resources = set()
+        signal.signal(signal.SIGINT, self.cleanup)
+        signal.signal(signal.SIGTERM, self.cleanup)
+        
+    def register(self, resource):
+        self.resources.add(resource)
+        
+    def cleanup(self, *args):
+        logger.info("Cleaning up resources...")
+        for resource in self.resources:
+            try:
+                resource.close()
+            except Exception as e:
+                logger.error(f"Error cleaning up resource: {str(e)}")
+        
+        # Shutdown thread pools
+        thread_pool.shutdown(wait=False)
+        process_pool.shutdown(wait=False)
+        
+        # Print performance metrics
+        logger.info("Performance Metrics:")
+        for op, stats in metrics.get_metrics().items():
+            logger.info(f"{op}:")
+            logger.info(f"  Average time: {stats['avg_time']:.3f}s")
+            logger.info(f"  Min time: {stats['min_time']:.3f}s")
+            logger.info(f"  Max time: {stats['max_time']:.3f}s")
+            logger.info(f"  Total operations: {stats['total_ops']}")
+            logger.info(f"  Errors: {stats['errors']}")
+        
+        sys.exit(0)
+
+# Initialize resource manager
+resource_manager = ResourceManager()
+
+async def display_menu():
     """Display the main menu options"""
-    print("\n=== Slite Document Management Menu ===")
-    print("1. Create a new document")
-    print("2. Update existing document")
-    print("3. Rename document")
-    print("4. Delete document")
-    print("5. Create new folder")
-    print("6. Rename folder")
-    print("7. Delete folder")
+    print("\nWhat would you like to do?")
+    print("1. Create a document")
+    print("2. Delete a document")
+    print("3. Edit a document")
+    print("4. Rename a document")
+    print("5. Create a folder")
+    print("6. Delete a folder")
+    print("7. Rename a folder")
     print("8. Exit")
-    print("=====================================")
 
-def display_item_details(item: dict, item_type: str = "item"):
-    """Display details of a document or folder including its ID"""
-    print("\n=== Item Details ===")
-    print(f"Type: {item_type}")
-    print(f"ID: {item.get('id')}")
-    print(f"Name: {item.get('name') or item.get('title')}")
-    if 'url' in item:
-        print(f"URL: {item['url']}")
-    print("==================")
+async def edit_document_menu():
+    """Display document editing options"""
+    print("\nHow would you like to edit the document?")
+    print("1. Add notes to existing content")
+    print("2. Replace existing content with new content")
+    print("3. Cancel")
 
-def handle_menu_choice(choice: str, slite: SliteAPI, current_folder_id: str = None):
-    """Handle the user's menu choice"""
+async def get_input(prompt: str = "") -> str:
+    """Get input from user"""
+    if prompt:
+        print(prompt, end="", flush=True)
+    return sys.stdin.readline().strip()
+
+async def handle_menu_choice(choice: str, slite: SliteAPI, folder: Dict) -> bool:
+    """Handle menu choice"""
     try:
         if choice == "1":
-            folder_id = input("Enter folder ID (press Enter to use current folder): ").strip() or current_folder_id
-            title = input("Enter document title: ").strip()
-            content = input("Enter document content (markdown supported): ").strip()
-            doc = slite.create_document(title=title, markdown_content=content, folder_id=folder_id)
-            logger.info(f"Created document: {doc['title']}")
-            display_item_details(doc, "document")
+            # List available folders
+            print("\nAvailable folders:")
+            print("-" * 50)
+            folders = await slite.list_folders()
+            logger.info(f"Retrieved {len(folders)} folders")
             
-        elif choice == "2":
-            doc_id = input("Enter document ID to update: ").strip()
-            current_doc = slite.get_note(doc_id)
-            if current_doc:
-                print(f"\nCurrent title: {current_doc.get('title')}")
-                new_title = input("Enter new title (press Enter to keep current): ").strip()
-                print("\nEnter new content (markdown supported, press Enter when done):")
-                new_content = input().strip()
+            print("\nFolders:")
+            for f in folders:
+                display_item_details(f, "document")
                 
-                doc = slite.update_document(
-                    doc_id=doc_id,
-                    title=new_title or current_doc.get('title'),
-                    markdown_content=new_content
-                )
-                logger.info(f"Updated document: {doc['title']}")
+            print("\nAvailable documents:")
+            print("-" * 50)
+            docs = await slite.list_documents()
+            for doc in docs:
                 display_item_details(doc, "document")
             
-        elif choice == "3":
-            doc_id = input("Enter document ID to rename: ").strip()
-            current_doc = slite.get_note(doc_id)
-            if current_doc:
-                print(f"\nCurrent title: {current_doc.get('title')}")
-                new_title = input("Enter new title: ").strip()
-                doc = slite.update_document(
-                    doc_id=doc_id,
-                    title=new_title,
-                    markdown_content=current_doc.get('markdown', '')
-                )
-                logger.info(f"Renamed document to: {doc['title']}")
-                display_item_details(doc, "document")
+            # Get folder ID
+            folder_id = await get_input("\nEnter folder ID to create document in: ")
             
-        elif choice == "4":
-            doc_id = input("Enter document ID to delete: ").strip()
-            confirm = input("Are you sure you want to delete this document? (y/n): ").lower()
-            if confirm == 'y':
-                result = slite.delete_document(doc_id)
-                logger.info(result['message'])
+            # Find folder name
+            folder_name = "Unknown"
+            for f in folders:
+                if f.get('id') == folder_id:
+                    folder_name = f.get('title', 'Untitled')
+                    break
             
-        elif choice == "5":
-            name = input("Enter folder name: ").strip()
-            description = input("Enter folder description: ").strip()
-            folder = slite.create_folder(name=name, description=description)
-            logger.info(f"Created folder: {folder['name']}")
-            display_item_details(folder, "folder")
+            print(f"\nCreating document in folder: {folder_name}")
             
-        elif choice == "6":
-            folder_id = input("Enter folder ID to rename: ").strip()
-            new_name = input("Enter new folder name: ").strip()
-            new_description = input("Enter new description (optional): ").strip()
-            folder = slite.update_folder(folder_id=folder_id, name=new_name, description=new_description or None)
-            logger.info(f"Renamed folder to: {folder['name']}")
-            display_item_details(folder, "folder")
+            # Get document details
+            title = await get_input("\nEnter document title: ")
+            print("\nEnter document content (press Enter twice when done):")
             
-        elif choice == "7":
-            folder_id = input("Enter folder ID to delete: ").strip()
-            confirm = input("Are you sure you want to delete this folder? (y/n): ").lower()
-            if confirm == 'y':
-                result = slite.delete_folder(folder_id)
-                logger.info(result['message'])
+            content_lines = []
+            while True:
+                line = await get_input("")  # Empty prompt for content lines
+                if line == "":
+                    break
+                content_lines.append(line)
+            
+            content = "\n".join(content_lines)
+            
+            # Create document
+            doc = await slite.create_document(
+                title=title,
+                content=content,
+                parent_note_id=folder_id
+            )
+            
+            print("\nDocument created successfully!")
+            print("\nDocument details:")
+            print("-" * 50)
+            print(f"Title: {doc.get('title', 'Untitled')}")
+            print(f"ID: {doc.get('id', 'Unknown')}")
+            print(f"URL: {doc.get('url', 'No URL available')}")
+            print("-" * 50)
+            
+        elif choice == '2':
+            # Delete document
+            doc_id = await get_input("\nEnter document ID to delete: ")
+            if not doc_id:
+                logger.error("No document ID provided")
+                return True
                 
-        elif choice == "8":
-            logger.info("Exiting menu...")
+            try:
+                # Get document details first
+                logger.info(f"Checking document {doc_id}...")
+                doc = await slite.get_document(doc_id)
+                
+                # Show document details and confirm deletion
+                print("\nDocument details:")
+                print("-" * 50)
+                print(f"Title: {doc.get('title', 'Untitled')}")
+                content_preview = doc.get('content', '')
+                if isinstance(content_preview, dict):
+                    content_preview = content_preview.get('markdown', '')[:100]
+                elif isinstance(content_preview, str):
+                    content_preview = content_preview[:100]
+                print(f"Content preview: {content_preview}...")
+                print("-" * 50)
+                
+                confirm = await get_input("\nAre you sure you want to delete this document? (y/n): ")
+                if confirm.lower() != 'y':
+                    print("Deletion cancelled.")
+                    return True
+                    
+                # Proceed with deletion
+                logger.info(f"Deleting document {doc_id}...")
+                await slite.delete_document(doc_id)
+                print("\nDocument deleted successfully!")
+                
+            except Exception as e:
+                if "Resource not found" in str(e):
+                    print(f"\nDocument {doc_id} not found or already deleted.")
+                else:
+                    logger.error(f"Error deleting document: {str(e)}")
+                    print("\nThere was an error deleting the document. Please try again.")
+                    
+        elif choice == '3':
+            # Edit document
+            # First list available documents
+            logger.info("\nAvailable documents:")
+            docs = await slite.list_documents()
+            for doc in docs:
+                display_item_details(doc, "document")
+                
+            print("\nEdit Document Options:")
+            print("1. Add to existing content")
+            print("2. Replace content")
+            edit_type = await get_input("\nChoose edit type (1 or 2): ")
+            
+            if edit_type not in ['1', '2']:
+                logger.error("Invalid edit type selected")
+                return True
+                
+            doc_id = await get_input("\nEnter document ID to edit: ")
+            
+            try:
+                # Verify document exists and get current content
+                logger.info(f"Retrieving document {doc_id}...")
+                existing_doc = await slite.get_document(doc_id)
+                
+                if not existing_doc:
+                    logger.error(f"Could not find document {doc_id}")
+                    return True
+                
+                if edit_type == '1':
+                    # Add to existing - ask for new notes
+                    print("\nEnter the new notes to append (press Enter twice when done):")
+                    notes_lines = []
+                    while True:
+                        line = await get_input("")  # Empty prompt for content lines
+                        if line == "":
+                            break
+                        notes_lines.append(line)
+                    
+                    if not notes_lines:
+                        logger.error("No notes provided to append")
+                        return True
+                    
+                    try:
+                        # Get existing content
+                        logger.info(f"Retrieving document {doc_id}...")
+                        existing_doc = await slite.get_document(doc_id)
+                        
+                        # Get content from the response
+                        existing_content = existing_doc.get('content', '')
+                        if isinstance(existing_content, str):
+                            existing_content = existing_content
+                        elif isinstance(existing_content, dict):
+                            existing_content = existing_content.get('markdown', '')
+                        else:
+                            existing_content = ''
+                        
+                        logger.info(f"Existing content length: {len(existing_content)} characters")
+                        logger.info(f"First 100 chars of existing content: {existing_content[:100]}")
+                        
+                        # Format new notes as a section
+                        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+                        new_section = [
+                            "",  # Empty line for spacing
+                            f"## 📝 Updates ({timestamp})",
+                            ""  # Empty line for spacing
+                        ]
+                        
+                        # Add each note as a bullet point
+                        for note in notes_lines:
+                            new_section.append(f"- {note}")
+                        new_section.append("")  # Empty line at the end
+                        
+                        # Combine existing content with new section
+                        existing_content = existing_content.strip()
+                        new_content = "\n".join(new_section)
+                        
+                        if existing_content:
+                            combined_content = f"{existing_content}\n\n{new_content}"
+                        else:
+                            combined_content = new_content
+                        
+                        logger.info(f"Combined content length: {len(combined_content)} characters")
+                        logger.info(f"First 100 chars of combined content: {combined_content[:100]}")
+                        
+                        # Update the document with combined content
+                        logger.info("Updating document with combined content...")
+                        await slite.update_document(doc_id, combined_content)
+                        
+                        print("\nDocument has been updated successfully!")
+                        print("\nNew content added:")
+                        print("-" * 50)
+                        for line in notes_lines:
+                            print(line)
+                        print("-" * 50)
+                        
+                        # Verify the update
+                        logger.info("Verifying update...")
+                        updated_doc = await slite.get_document(doc_id)
+                        updated_content = updated_doc.get('content', '')
+                        if isinstance(updated_content, str):
+                            updated_content = updated_content
+                        elif isinstance(updated_content, dict):
+                            updated_content = updated_content.get('markdown', '')
+                        else:
+                            updated_content = ''
+                        
+                        if updated_content.strip() == combined_content.strip():
+                            logger.info("Update verification successful - content matches")
+                        else:
+                            logger.warning("Update verification failed - content mismatch!")
+                            logger.info(f"Expected content length: {len(combined_content)}")
+                            logger.info(f"Actual content length: {len(updated_content)}")
+                        
+                    except Exception as e:
+                        logger.error(f"Error appending content: {str(e)}")
+                        print("\nThere was an error updating the document. Please try again.")
+                        return True
+                        
+                elif edit_type == '2':
+                    # Replace content - ask for new content
+                    print("\nEnter the new content (press Enter twice when done):")
+                    content_lines = []
+                    while True:
+                        line = await get_input("")  # Empty prompt for content lines
+                        if line == "":
+                            break
+                        content_lines.append(line)
+                    
+                    if not content_lines:
+                        logger.error("No content provided")
+                        return True
+                    
+                    try:
+                        # Update the document with new content
+                        new_content = "\n".join(content_lines)
+                        logger.info("Updating document with new content...")
+                        await slite.update_document(doc_id, new_content)
+                        
+                        print("\nDocument has been updated successfully!")
+                        print("\nNew content:")
+                        print("-" * 50)
+                        print(new_content)
+                        print("-" * 50)
+                        
+                        # Verify the update
+                        logger.info("Verifying update...")
+                        updated_doc = await slite.get_document(doc_id)
+                        if updated_doc and updated_doc.get('markdown', '').strip() == new_content.strip():
+                            logger.info("Update verification successful")
+                        else:
+                            logger.warning("Update verification failed - content may not match")
+                        
+                    except Exception as e:
+                        logger.error(f"Error replacing content: {str(e)}")
+                        print("\nThere was an error updating the document. Please try again.")
+                        return True
+                
+            except Exception as e:
+                logger.error(f"Error editing document: {str(e)}")
+                return True
+            
+        elif choice == '4':
+            # Rename document
+            print("\nAvailable documents:")
+            docs = await slite.list_documents()
+            for doc in docs:
+                print(f"ID: {doc.get('id')} - Title: {doc.get('title', 'Untitled')}")
+            
+            doc_id = await get_input("\nEnter document ID to rename: ")
+            if not doc_id:
+                print("No document ID provided")
+                return True
+            
+            # Find current document title
+            current_title = None
+            for doc in docs:
+                if doc.get('id') == doc_id:
+                    current_title = doc.get('title', 'Untitled')
+                    break
+            
+            if not current_title:
+                print(f"Document with ID {doc_id} not found")
+                return True
+            
+            print(f"\nCurrent title: {current_title}")
+            new_title = await get_input("Enter new title: ")
+            
+            if not new_title:
+                print("No new title provided")
+                return True
+            
+            # Rename the document
+            doc = await slite.rename_document(doc_id, new_title)
+            print(f"\nDocument renamed successfully from '{current_title}' to '{new_title}'!")
+            
+        elif choice == '5':
+            # Create folder
+            folder_name = await get_input("Enter folder name: ")
+            new_folder = await slite.create_folder(folder_name)
+            logger.info("Created new folder:")
+            display_item_details(new_folder, "folder")
+            
+        elif choice == '6':
+            # Delete folder
+            # First list available folders
+            logger.info("\nAvailable folders:")
+            folders = await slite.list_folders()
+            for folder in folders:
+                display_item_details(folder, "folder")
+                
+            folder_id = await get_input("\nEnter folder ID to delete: ")
+            await slite.delete_folder(folder_id)
+            logger.info(f"Folder {folder_id} deleted successfully")
+            
+        elif choice == '7':
+            # Rename folder
+            # First list available folders
+            logger.info("\nAvailable folders:")
+            folders = await slite.list_folders()
+            for folder in folders:
+                display_item_details(folder, "folder")
+                
+            folder_id = await get_input("\nEnter folder ID to rename: ")
+            new_name = await get_input("Enter new name: ")
+            await slite.rename_folder(folder_id, new_name)
+            logger.info(f"Folder renamed to '{new_name}' successfully")
+            
+        elif choice == '8':
+            # Exit
+            logger.info("Exiting...")
             return False
             
         else:
-            logger.info("Invalid choice. Please try again.")
+            logger.error("Invalid choice")
             
         return True
             
     except Exception as e:
-        logger.error(f"Error processing menu choice: {str(e)}")
+        logger.error(f"Error handling menu choice: {str(e)}")
         return True
 
-def run_menu(slite: SliteAPI, current_folder_id: str = None):
-    """Run the menu loop"""
-    while True:
-        display_menu()
-        choice = input("Enter your choice (1-8): ").strip()
-        if not handle_menu_choice(choice, slite, current_folder_id):
-            break
-
-def prompt_for_deletion(folder_id: str, folder_name: str, doc_id: str, doc_name: str, slite: SliteAPI):
-    """Prompt user for deletion after timer expires"""
-    print("\n" + "="*50)
-    logger.info("Time to decide about deletion!")
-    logger.info("Do you want to delete the following items?")
-    logger.info(f"1. Folder: {folder_name}")
-    logger.info(f"2. Document: {doc_name}")
-    print("="*50)
-    
-    while True:
-        response = input("\nEnter 'y' for Yes or 'n' for No: ").lower()
-        if response == 'y':
+def display_item_details(item: dict, item_type: str = "item"):
+    """Display details of a document or folder including its ID and URL"""
+    if not item:
+        return
+        
+    item_id = item.get('id')
+    if item_id:
+        # For newly created items, highlight that this is a new ID
+        created_timestamp = item.get('createdAt')
+        if isinstance(created_timestamp, str):
             try:
-                delete_result = slite.delete_folder(folder_id)
-                logger.info(delete_result['message'])
-                break
-            except Exception as e:
-                logger.error(f"Error deleting items: {str(e)}")
-                break
-        elif response == 'n':
-            logger.info("Items will be kept.")
-            logger.info("Opening document management menu...")
-            run_menu(slite, folder_id)
-            break
-        else:
-            logger.info("Invalid input. Please enter 'y' or 'n'")
-
-class DeletionTimer:
-    def __init__(self, folder_id: str, folder_name: str, doc_id: str, doc_name: str, slite: SliteAPI):
-        self.folder_id = folder_id
-        self.folder_name = folder_name
-        self.doc_id = doc_id
-        self.doc_name = doc_name
-        self.slite = slite
-        self.timer = None
-        self.event = threading.Event()
-
-    def start(self):
-        """Start the deletion timer"""
-        self.timer = threading.Timer(
-            30,  # 30 seconds for testing, change to 300 for 5 minutes
-            self._timer_callback
-        )
-        self.timer.start()
-        logger.info("\nWaiting 30 seconds before prompting for deletion...")
-        logger.info("You can continue using the application. A prompt will appear when it's time to decide about deletion.")
-
-    def _timer_callback(self):
-        """Timer callback to prompt for deletion"""
-        prompt_for_deletion(
-            self.folder_id,
-            self.folder_name,
-            self.doc_id,
-            self.doc_name,
-            self.slite
-        )
-        self.event.set()
-
-    def wait(self):
-        """Wait for the deletion decision"""
-        self.event.wait()
-
-def demo_folder_operations(slite: SliteAPI):
-    """
-    Demonstrate folder operations.
-    This function showcases the creation, update, and deletion of folders and documents.
-    It also demonstrates the use of event handlers for folder and document events.
-    """
+                created_timestamp = int(created_timestamp)
+            except (ValueError, TypeError):
+                created_timestamp = 0
+                
+        is_new = time.time() - (created_timestamp / 1000 if created_timestamp else 0) < 60  # Created in last minute
+        id_prefix = "NEW " if is_new else ""
+        print(f"\n{id_prefix}{item_type.title()} ID: {item_id}")
+        print(f"Title: {item.get('name') or item.get('title')}")
+        
+        # Display URL
+        url = f"https://app.slite.com/app/docs/{item_id}"
+        print(f"URL: {url}")
+        
+    if item_type == "folder":
+        print(f"Description: {item.get('description', '')}")
+    
+    created_at = item.get('createdAt')
+    updated_at = item.get('updatedAt')
+    
     try:
-        # Register event handlers
-        slite.events.on_folder_created(on_folder_created)
-        slite.events.on_folder_updated(on_folder_updated)
-        slite.events.on_document_created(on_document_created)
-        slite.events.on_document_updated(on_document_updated)
-
-        # Create a folder
-        folder = slite.create_folder(
-            name="Meeting Notes",
-            description="Collection of meeting notes and discussions"
-        )
-        logger.info(f"Created folder: {folder['name']}")
-        display_item_details(folder, "folder")
-
-        # Update the folder
-        updated_folder = slite.update_folder(
-            folder_id=folder['id'],
-            name="Team Meeting Notes",
-            description="Collection of team meeting notes and discussions"
-        )
-        logger.info(f"Updated folder name to: {updated_folder['name']}")
-        display_item_details(updated_folder, "folder")
-
-        # Create a document in the folder
-        notes_data = read_meeting_notes()
+        if created_at:
+            if isinstance(created_at, str):
+                created_at = int(created_at)
+            created_time = datetime.fromtimestamp(created_at / 1000).strftime('%Y-%m-%d %H:%M:%S')
+            print(f"Created: {created_time}")
+    except (ValueError, TypeError) as e:
+        logger.warning(f"Could not parse creation timestamp: {created_at}")
         
-        # Get the first note from the list, or create an empty one if list is empty
-        current_note = notes_data[0] if notes_data else {'title': 'Untitled Meeting', 'content': []}
+    try:
+        if updated_at:
+            if isinstance(updated_at, str):
+                updated_at = int(updated_at)
+            updated_time = datetime.fromtimestamp(updated_at / 1000).strftime('%Y-%m-%d %H:%M:%S')
+            print(f"Updated: {updated_time}")
+    except (ValueError, TypeError) as e:
+        logger.warning(f"Could not parse update timestamp: {updated_at}")
         
-        # Format the current date for the document title
-        current_date = datetime.now().strftime('%Y-%m-%d')
-        doc_title = f"{current_date} - {current_note.get('title', 'Untitled Meeting')}"
-        
-        markdown_content = slite.format_meeting_notes_markdown(current_note)
-        doc = slite.create_document(
-            title=doc_title,
-            markdown_content=markdown_content,
-            folder_id=folder['id']
-        )
-        logger.info(f"Created document: {doc['title']}")
-        display_item_details(doc, "document")
+    print("-" * 50)
 
-        # Update the document
-        updated_doc = slite.update_document(
-            doc_id=doc['id'],
-            title=f"{doc_title} (Updated)",
-            markdown_content=markdown_content,
-            folder_id=folder['id']
-        )
-        logger.info(f"Updated document title to: {updated_doc['title']}")
-        display_item_details(updated_doc, "document")
+async def main():
+    """Main function to run the demo"""
+    try:
+        # Load and validate API key
+        api_key = os.getenv('SLITE_API_KEY')
+        if not api_key:
+            logger.error("SLITE_API_KEY environment variable not set. Please check your .env file")
+            logger.error("Make sure your .env file contains: SLITE_API_KEY=your_api_key_here")
+            return
 
-        # Print the URLs for reference
-        if doc.get('url'):
-            logger.info(f"Document URL: {doc['url']}")
-        if folder.get('url'):
-            logger.info(f"Folder URL: {folder['url']}")
+        # Test internet connectivity
+        try:
+            import socket
+            socket.create_connection(("8.8.8.8", 53), timeout=3)
+            logger.info("Internet connection available")
+        except OSError:
+            logger.error("No internet connection available. Please check your network connection.")
+            return
 
-        # Set up and start the deletion timer
-        deletion_timer = DeletionTimer(
-            folder['id'],
-            folder['name'],
-            doc['id'],
-            doc['title'],
-            slite
-        )
-        deletion_timer.start()
-        
-        # Wait for the deletion decision
-        deletion_timer.wait()
+        async with SliteAPI(api_key) as slite:
+            # Create initial folder and document
+            folder = await slite.create_folder("Meeting Notes")
+            logger.info("Created initial folder:")
+            display_item_details(folder, "folder")
+
+            # Convert and read meeting notes
+            notes = convert_text_to_json()
+            markdown_content = await slite.format_meeting_notes_markdown(notes)
+
+            # Create initial document
+            doc = await slite.create_document(
+                title=notes.get('metadata', {}).get('title', 'Meeting Notes'),
+                content=markdown_content,
+                parent_note_id=folder['id']
+            )
+            logger.info("Created initial document:")
+            display_item_details(doc, "document")
+
+            # Main menu loop
+            while True:
+                await display_menu()
+                choice = await get_input("\nEnter your choice (1-8): ")
+                if not await handle_menu_choice(choice, slite, folder):
+                    break
 
     except Exception as e:
-        logger.error(f"Error in folder operations: {str(e)}")
+        logger.error(f"Error in main: {str(e)}")
+        if "getaddrinfo failed" in str(e):
+            logger.error("DNS resolution failed. Please check your internet connection and DNS settings.")
         raise
 
 if __name__ == "__main__":
     """
     Main execution flow:
     1. Load environment variables
-    2. Initialize Slite API client
-    3. Convert text notes to JSON (automatic)
-    4. Process meeting notes and interact with Slite
-    5. Handle user interactions through menu system
+    2. Set up logging
+    3. Initialize Slite API client
+    4. Run demo operations
     """
-    load_dotenv()
-    api_key = os.getenv("SLITE_API_KEY")
-    
-    if not api_key:
-        logger.error("SLITE_API_KEY not found in environment variables")
-        sys.exit(1)
-    
-    slite = SliteAPI(api_key)
-    demo_folder_operations(slite)
+    asyncio.run(main())
