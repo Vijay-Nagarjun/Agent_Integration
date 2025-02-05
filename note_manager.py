@@ -58,19 +58,9 @@ class NoteManager:
         """
         try:
             logger.info(f"Creating note with title: {title}")
-            
-            # Create note model
-            note = MeetingNote(
-                title=title,
-                content=content
-            )
-            
-            # Create note and cache it
-            response = await self.api.create_note_async(note)
+            response = await self.api.create_note_async(title, content)
             self._note_cache[response['id']] = response
-            
             return response
-            
         except Exception as e:
             logger.error(f"Error creating note: {str(e)}")
             raise
@@ -92,20 +82,20 @@ class NoteManager:
         self._note_cache[note_id] = response
         return response
     
-    async def update_note(self, note_id: str, title: str, content: str) -> Dict:
+    async def update_note(self, note_id: str, content: str) -> Dict:
         """
         Update a note asynchronously.
         
         Args:
             note_id (str): ID of the note to update
-            title (str): New title
             content (str): New content
             
         Returns:
             Dict: Updated note data
         """
         try:
-            response = await self.api.update_note_async(note_id, title, content)
+            logger.info(f"Updating note {note_id}")
+            response = await self.api.update_note_async(note_id, content)
             self._note_cache[note_id] = response
             return response
         except Exception as e:
@@ -142,21 +132,17 @@ class NoteManager:
     
     async def search_notes(self, query: str) -> List[Dict]:
         """
-        Search for notes in Slite.
+        Search for notes asynchronously.
         
         Args:
             query (str): Search query string
             
         Returns:
-            List[Dict]: List of notes matching the search query
-            
-        Raises:
-            Exception: If search operation fails
+            List[Dict]: List of matching notes
         """
         try:
-            response = await self.api.search_notes_async(query)
-            return response
-            
+            logger.info(f"Searching notes with query: {query}")
+            return await self.api.search_notes_async(query)
         except Exception as e:
             logger.error(f"Error searching notes: {str(e)}")
             raise

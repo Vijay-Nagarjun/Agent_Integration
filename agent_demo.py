@@ -28,7 +28,7 @@ class AgentDemo:
         load_dotenv()
         
         # Verify environment variables
-        required_vars = ["SLITE_API_KEY", "OPENAI_API_KEY"]
+        required_vars = ["SLITE_API_KEY", "GEMINI_API_KEY"]
         missing_vars = [var for var in required_vars if not os.getenv(var)]
         if missing_vars:
             raise ValueError(f"Missing required environment variables: {', '.join(missing_vars)}")
@@ -40,7 +40,9 @@ class AgentDemo:
     async def initialize_agent(self):
         """Initialize the Slite agent"""
         if not self.agent:
-            self.agent = SliteAgent(os.getenv("SLITE_API_KEY"))
+            slite_api_key = os.getenv("SLITE_API_KEY")
+            gemini_api_key = os.getenv("GEMINI_API_KEY")
+            self.agent = SliteAgent(api_key=slite_api_key, gemini_api_key=gemini_api_key)
             await self.agent.initialize_agent()
 
     async def cleanup(self):

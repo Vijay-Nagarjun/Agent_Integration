@@ -1,0 +1,64 @@
+{
+  "timestamp": 1735567845.955398,
+  "metadata": {
+    "date": "December 27, 2024",
+    "time": "2:00 PM - 3:00 PM",
+    "location": "Zoom Meeting",
+    "attendees": [
+      "Jane Doe (Project Manager)",
+      "John Smith (Senior Developer)",
+      "Alice Brown (UI/UX Designer)",
+      "Mark Lee (Marketing Lead)",
+      "Sarah White (QA Lead)"
+    ]
+  },
+  "sections": [
+    {
+      "title": "Meeting Notes",
+      "points": []
+    },
+    {
+      "title": "Agenda Items:",
+      "points": [
+        "**Jane Doe** provided a general update on the current status of the project.",
+        "Key milestones have been met:",
+        "Phase 1 (Research & Planning) completed.",
+        "Phase 2 (Prototype Development) in progress, 80% complete.",
+        "Some minor delays due to external dependencies, expected to finish within the next week.",
+        "**Alice Brown** shared new UI/UX designs for the mobile app interface.",
+        "Feedback from stakeholders:",
+        "Positive response to the color scheme and general layout.",
+        "Need to improve navigation flow, especially for first-time users.",
+        "**Action Item**: Alice to revise the design based on feedback and send updated version by EOD Friday.",
+        "**John Smith** raised concerns regarding the integration of third-party API for payment gateway.",
+        "Issue with the API documentation clarity, some features are not well-documented.",
+        "Proposed action: **John** will reach out to the third-party vendor for clarification and support.",
+        "**Action Item**: John to schedule a meeting with the vendor by Friday, December 29th.",
+        "**Mark Lee** presented the marketing plan for the product launch.",
+        "Focus on digital channels (social media, email marketing, influencer partnerships).",
+        "Special attention to be given to the upcoming holiday season for maximum engagement.",
+        "**Action Item**: Mark to prepare social media content calendar and share with the team by next week.",
+        "**Sarah White** discussed the current testing progress.",
+        "QA team has identified some minor bugs in the latest build, mostly related to user login.",
+        "Plan: Continue testing and escalate critical issues to the development team within 24 hours.",
+        "**Action Item**: Sarah to ensure all test cases are updated in the system by next Tuesday.",
+        "**Jane Doe** highlighted the budget status.",
+        "The project is within budget, but some additional funds may be needed for unforeseen expenses related to API integration.",
+        "**Action Item**: Jane to submit a revised budget request by the end of next week."
+      ]
+    },
+    {
+      "title": "Decisions Made:",
+      "points": [
+        "Revised UI design to be sent by Alice by Friday.",
+        "John to contact API vendor for clarifications.",
+        "Marketing content calendar to be finalized by Mark by next week.",
+        "QA team to continue testing and prioritize critical bugs."
+      ]
+    },
+    {
+      "title": "Action Items:",
+      "points": []
+    }
+  ]
+}

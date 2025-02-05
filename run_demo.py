@@ -14,6 +14,8 @@ import queue
 from typing import Dict, List, Optional
 import signal
 from contextlib import contextmanager
+import random
+import traceback
 
 # Load environment variables at the start
 try:
@@ -330,61 +332,17 @@ async def handle_menu_choice(choice: str, slite: SliteAPI, folder: Dict) -> bool
     """Handle menu choice"""
     try:
         if choice == "1":
-            # List available folders
-            print("\nAvailable folders:")
-            print("-" * 50)
+            # Create structured note
             folders = await slite.list_folders()
-            logger.info(f"Retrieved {len(folders)} folders")
-            
-            print("\nFolders:")
+            print("\nAvailable folders:")
             for f in folders:
-                display_item_details(f, "document")
-                
-            print("\nAvailable documents:")
-            print("-" * 50)
-            docs = await slite.list_documents()
-            for doc in docs:
-                display_item_details(doc, "document")
+                display_item_details(f, "folder")
             
-            # Get folder ID
-            folder_id = await get_input("\nEnter folder ID to create document in: ")
-            
-            # Find folder name
-            folder_name = "Unknown"
-            for f in folders:
-                if f.get('id') == folder_id:
-                    folder_name = f.get('title', 'Untitled')
-                    break
-            
-            print(f"\nCreating document in folder: {folder_name}")
-            
-            # Get document details
-            title = await get_input("\nEnter document title: ")
-            print("\nEnter document content (press Enter twice when done):")
-            
-            content_lines = []
-            while True:
-                line = await get_input("")  # Empty prompt for content lines
-                if line == "":
-                    break
-                content_lines.append(line)
-            
-            content = "\n".join(content_lines)
-            
-            # Create document
-            doc = await slite.create_document(
-                title=title,
-                content=content,
-                parent_note_id=folder_id
-            )
+            folder_id = await get_input("\nEnter folder ID (leave empty for root): ")
+            doc = await create_structured_note(slite, folder_id)
             
             print("\nDocument created successfully!")
-            print("\nDocument details:")
-            print("-" * 50)
-            print(f"Title: {doc.get('title', 'Untitled')}")
-            print(f"ID: {doc.get('id', 'Unknown')}")
-            print(f"URL: {doc.get('url', 'No URL available')}")
-            print("-" * 50)
+            display_item_details(doc, "document")
             
         elif choice == '2':
             # Delete document
@@ -668,6 +626,120 @@ async def handle_menu_choice(choice: str, slite: SliteAPI, folder: Dict) -> bool
         logger.error(f"Error handling menu choice: {str(e)}")
         return True
 
+async def create_structured_note(slite: SliteAPI, folder_id: Optional[str] = None) -> Dict:
+    """Create a structured meeting note with proper formatting"""
+    print("\nCreating a structured meeting note")
+    print("-" * 50)
+    
+    # Get basic meeting details
+    title = await get_input("Enter meeting title: ")
+    date = await get_input("Enter meeting date (YYYY-MM-DD) [Today]: ") or datetime.now().strftime("%Y-%m-%d")
+    time = await get_input("Enter meeting time (HH:MM) [Now]: ") or datetime.now().strftime("%H:%M")
+    location = await get_input("Enter meeting location: ")
+    
+    # Get attendees
+    print("\nEnter attendees (one per line, press Enter twice when done):")
+    attendees = []
+    while True:
+        attendee = await get_input()
+        if not attendee:
+            break
+        attendees.append(attendee)
+    
+    # Get meeting content sections
+    sections = {}
+    print("\nEnter content for each section:")
+    for section in ["Progress Update", "Discussion Points", "Action Items", "Next Steps"]:
+        print(f"\n{section}:")
+        content_lines = []
+        while True:
+            line = await get_input()
+            if not line:
+                break
+            content_lines.append(line)
+        sections[section] = content_lines
+    
+    # Format content in markdown
+    content = f"""# {title}
+
+## Meeting Details
+- Date: {date}
+- Time: {time}
+- Location: {location}
+- Attendees: {', '.join(attendees)}
+
+## Progress Update
+{chr(10).join('- ' + line for line in sections['Progress Update'])}
+
+## Discussion Points
+{chr(10).join('- ' + line for line in sections['Discussion Points'])}
+
+## Action Items
+{chr(10).join('- ' + line for line in sections['Action Items'])}
+
+## Next Steps
+{chr(10).join('- ' + line for line in sections['Next Steps'])}
+"""
+    
+    try:
+        with measure_time('create_document'):
+            doc = await slite.create_document(
+                title=title,
+                content=content,
+                parent_note_id=folder_id
+            )
+            logger.info(f"Created structured note: {doc.get('id')}")
+            return doc
+    except Exception as e:
+        logger.error(f"Error creating structured note: {str(e)}")
+        metrics.record_error('create_document')
+        raise
+
+async def create_folder_structure(slite: SliteAPI) -> Dict[str, str]:
+    """Create a standard folder structure for organizing notes"""
+    folder_structure = {
+        "Meeting Notes": [
+            "Team Meetings",
+            "Project Updates",
+            "Client Meetings",
+            "Internal Reviews"
+        ],
+        "Documentation": [
+            "Project Specs",
+            "Technical Docs",
+            "Process Guides"
+        ]
+    }
+    
+    created_folders = {}
+    
+    try:
+        for main_folder, subfolders in folder_structure.items():
+            # Create main folder
+            main_folder_doc = await slite.create_document(
+                title=main_folder,
+                content=f"# {main_folder}\nOrganizational folder for {main_folder}",
+                is_folder=True
+            )
+            created_folders[main_folder] = main_folder_doc['id']
+            
+            # Create subfolders
+            for subfolder in subfolders:
+                subfolder_doc = await slite.create_document(
+                    title=subfolder,
+                    content=f"# {subfolder}\nSubfolder for {main_folder} - {subfolder}",
+                    is_folder=True,
+                    parent_note_id=main_folder_doc['id']
+                )
+                created_folders[f"{main_folder}/{subfolder}"] = subfolder_doc['id']
+        
+        logger.info("Created standard folder structure")
+        return created_folders
+    except Exception as e:
+        logger.error(f"Error creating folder structure: {str(e)}")
+        metrics.record_error('create_folder_structure')
+        raise
+
 def display_item_details(item: dict, item_type: str = "item"):
     """Display details of a document or folder including its ID and URL"""
     if not item:
@@ -721,60 +793,70 @@ def display_item_details(item: dict, item_type: str = "item"):
 async def main():
     """Main function to run the demo"""
     try:
-        # Load and validate API key
-        api_key = os.getenv('SLITE_API_KEY')
-        if not api_key:
-            logger.error("SLITE_API_KEY environment variable not set. Please check your .env file")
-            logger.error("Make sure your .env file contains: SLITE_API_KEY=your_api_key_here")
-            return
-
-        # Test internet connectivity
-        try:
-            import socket
-            socket.create_connection(("8.8.8.8", 53), timeout=3)
-            logger.info("Internet connection available")
-        except OSError:
-            logger.error("No internet connection available. Please check your network connection.")
-            return
-
-        async with SliteAPI(api_key) as slite:
-            # Create initial folder and document
-            folder = await slite.create_folder("Meeting Notes")
-            logger.info("Created initial folder:")
-            display_item_details(folder, "folder")
-
-            # Convert and read meeting notes
-            notes = convert_text_to_json()
-            markdown_content = await slite.format_meeting_notes_markdown(notes)
-
-            # Create initial document
-            doc = await slite.create_document(
-                title=notes.get('metadata', {}).get('title', 'Meeting Notes'),
-                content=markdown_content,
-                parent_note_id=folder['id']
-            )
-            logger.info("Created initial document:")
-            display_item_details(doc, "document")
-
-            # Main menu loop
+        async with SliteAPI(os.getenv("SLITE_API_KEY")) as slite:
+            print("\nConnected to Slite API")
+            
+            # Check if folder structure exists
+            folders = await slite.list_folders()
+            if not any(f.get('title') == 'Meeting Notes' for f in folders):
+                print("\nInitializing folder structure...")
+                folder_structure = await create_folder_structure(slite)
+                print("\nCreated standard folder structure:")
+                for path, folder_id in folder_structure.items():
+                    print(f"- {path} (ID: {folder_id})")
+            
             while True:
                 await display_menu()
                 choice = await get_input("\nEnter your choice (1-8): ")
-                if not await handle_menu_choice(choice, slite, folder):
+                
+                if choice == "8":
+                    print("\nExiting...")
                     break
-
+                    
+                if not await handle_menu_choice(choice, slite, None):
+                    break
+                
+                # Display performance metrics periodically
+                if random.random() < 0.1:  # 10% chance to show metrics
+                    print("\nPerformance Metrics:")
+                    print("-" * 50)
+                    for op, stats in metrics.get_metrics().items():
+                        print(f"{op}:")
+                        print(f"  Average time: {stats['avg_time']:.3f}s")
+                        print(f"  Total operations: {stats['total_ops']}")
+                        print(f"  Errors: {stats['errors']}")
+                    print("-" * 50)
+    
     except Exception as e:
         logger.error(f"Error in main: {str(e)}")
-        if "getaddrinfo failed" in str(e):
-            logger.error("DNS resolution failed. Please check your internet connection and DNS settings.")
-        raise
+        logger.error(traceback.format_exc())
+    finally:
+        # Display final metrics
+        print("\nFinal Performance Metrics:")
+        print(json.dumps(metrics.get_metrics(), indent=2))
 
 if __name__ == "__main__":
     """
     Main execution flow:
     1. Load environment variables
-    2. Set up logging
-    3. Initialize Slite API client
-    4. Run demo operations
+    2. Initialize API client
+    3. Create folder structure if needed
+    4. Start interactive menu
+    5. Handle user commands
+    6. Clean up on exit
     """
-    asyncio.run(main())
+    try:
+        # Load environment variables
+        load_dotenv(override=True)
+        if not os.getenv("SLITE_API_KEY"):
+            logger.error("SLITE_API_KEY environment variable not set")
+            sys.exit(1)
+            
+        # Run the async main function
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\nExiting gracefully...")
+    except Exception as e:
+        logger.error(f"Fatal error: {str(e)}")
+        logger.error(traceback.format_exc())
+        sys.exit(1)

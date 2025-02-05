@@ -4,14 +4,13 @@ import asyncio
 from datetime import datetime
 from typing import List, Dict, Any, Optional
 from functools import partial
-from langchain_community.chat_models import ChatOpenAI
+from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain.agents import AgentType, initialize_agent, Tool
 from langchain.memory import ConversationSummaryBufferMemory
 from langchain.prompts import MessagesPlaceholder
 from langchain.chains import LLMChain
 from langchain.prompts import ChatPromptTemplate, HumanMessagePromptTemplate, SystemMessagePromptTemplate
 from langchain.tools import StructuredTool
-from langchain.agents import AgentExecutor, OpenAIFunctionsAgent
 from pydantic import BaseModel, Field
 from note_manager import NoteManager, SliteAPI
 from models import MeetingNote, FolderStructure
@@ -293,17 +292,22 @@ class RenameNoteInput(BaseModel):
 class SliteAgent:
     """LangChain agent for interacting with Slite with enhanced features"""
 
-    def __init__(self, api_key: str, openai_api_key: str = None):
+    def __init__(self, api_key: str, gemini_api_key: str = None):
         """Initialize the SliteAgent with API keys and tools"""
         self.api_key = api_key
-        self.openai_api_key = openai_api_key or os.getenv("OPENAI_API_KEY")
-        if not self.openai_api_key:
-            raise ValueError("OpenAI API key must be provided")
+        self.gemini_api_key = gemini_api_key or os.getenv("GEMINI_API_KEY")
+        if not self.gemini_api_key:
+            raise ValueError("Gemini API key must be provided")
         
         self.api = None
         self.tools = None
         self.memory = ConversationSummaryBufferMemory(
-            llm=ChatOpenAI(temperature=0, openai_api_key=self.openai_api_key),
+            llm=ChatGoogleGenerativeAI(
+                model="gemini-pro",
+                temperature=0,
+                google_api_key=self.gemini_api_key,
+                convert_system_message_to_human=True
+            ),
             max_token_limit=500,
             memory_key="chat_history",
             return_messages=True
@@ -313,19 +317,18 @@ class SliteAgent:
         
     async def initialize_agent(self):
         """Initialize the agent with tools and memory"""
-        if self.agent_executor:
-            return
-        
-        # Initialize API and tools within async context
-        self.api = SliteAPI(self.api_key)
-        async with self.api:
+        if not self.agent_executor:
+            # Initialize API and tools
+            self.api = SliteAPI(self.api_key)
+            await self.api.__aenter__()
             self.tools = SliteTools(self.api)
             
+            # Create tools list
             tools = [
                 StructuredTool.from_function(
                     func=self.tools.search_notes,
                     name="SearchNotes",
-                    description="Search for notes using a query. Returns up to 5 most relevant results.",
+                    description="Search for notes using a query.",
                     args_schema=SearchNotesInput,
                     coroutine=self.tools.search_notes
                 ),
@@ -387,7 +390,7 @@ class SliteAgent:
                 )
             ]
             
-            system_message = """You are a helpful assistant that manages notes and folders in Slite.
+            system_prompt = """You are a helpful assistant that manages notes and folders in Slite.
             
             Available tools:
             1. SearchNotes:
@@ -447,14 +450,27 @@ class SliteAgent:
             7. "Rename a note":
                - Use RenameNote to rename a note"""
             
+            human_message = HumanMessagePromptTemplate.from_template("{input}\n\nCurrent conversation:\n{agent_scratchpad}")
+            chat_prompt = ChatPromptTemplate.from_messages([
+                SystemMessagePromptTemplate.from_template(system_prompt),
+                MessagesPlaceholder(variable_name="chat_history"),
+                human_message
+            ])
+
             self.agent_executor = initialize_agent(
                 tools=tools,
-                llm=ChatOpenAI(temperature=0.7, openai_api_key=self.openai_api_key),
+                llm=ChatGoogleGenerativeAI(
+                    model="gemini-pro",
+                    temperature=0,
+                    google_api_key=self.gemini_api_key,
+                    convert_system_message_to_human=True
+                ),
                 agent=AgentType.STRUCTURED_CHAT_ZERO_SHOT_REACT_DESCRIPTION,
                 verbose=True,
                 memory=self.memory,
                 agent_kwargs={
-                    "system_message": system_message,
+                    "system_message": system_prompt,
+                    "input_variables": ["input", "agent_scratchpad", "chat_history"]
                 }
             )
     

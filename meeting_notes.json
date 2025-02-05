@@ -1,95 +1,130 @@
-[
-  {
-    "title": "Tourist Places to Visit in Karnataka",
-    "content": [
-      "**Date:** December 19, 2024",
-      "**Topic:** Tourist Places to Visit in Karnataka",
-      "**Attendees:** 25",
-      "---",
-      "### 1. **Introduction**",
-      "- Karnataka is known for its diverse landscapes, rich culture, historic landmarks, and vibrant traditions.",
-      "- The state offers a mix of cultural heritage, wildlife sanctuaries, scenic beaches, and modern attractions.",
-      "---",
-      "### 2. **Key Tourist Places in Karnataka**",
-      "#### **A. Historical and Heritage Sites**",
-      "- **Hampi (UNESCO World Heritage Site):**",
-      "- Famous for the ancient ruins of Vijayanagara Empire.",
-      "- Highlights: Virupaksha Temple, Vittala Temple, Stone Chariot.",
-      "- A popular destination for history buffs and photography enthusiasts.",
-      "- **Badami:**",
-      "- Known for rock-cut temples and historical fortifications.",
-      "- A significant Chalukya architectural site.",
-      "- **Bijapur (Vijayapura):**",
-      "- Famous for its Islamic architecture.",
-      "- Key attractions: Gol Gumbaz, Ibrahim Roza, and Bijapur Fort.",
-      "- **Mysore:**",
-      "- The city is famous for Mysore Palace, Chamundeshwari Temple, and the Dussehra festival.",
-      "- Known for silk, sandalwood, and its royal history.",
-      "- **Srirangapatna:**",
-      "- Historical town near Mysore, associated with Tipu Sultan.",
-      "- Important sites: Tipu Sultan\u00e2\u20ac\u2122s Summer Palace, Ranganathaswamy Temple, and the Dariya Daulat Bagh.",
-      "#### **B. Natural Attractions and Scenic Spots**",
-      "- **Coorg (Kodagu):**",
-      "- Known for its coffee plantations, waterfalls, and misty hills.",
-      "- Popular spots: Abbey Falls, Dubare Elephant Camp, Raja\u00e2\u20ac\u2122s Seat.",
-      "- **Chikmagalur:**",
-      "- Famous for coffee estates and scenic hills.",
-      "- Key locations: Mullayanagiri, Baba Budangiri, and Hebbe Falls.",
-      "- **Agumbe:**",
-      "- Known as the \"Cherrapunji of the South\" for its monsoon rains.",
-      "- Famous for sunsets and rich biodiversity.",
-      "- The Agumbe Rainforest Research Station (ARRS) is located here.",
-      "- **Kabini:**",
-      "- Popular for wildlife safari and the Kabini River.",
-      "- Wildlife enthusiasts can explore Nagarhole National Park.",
-      "- **Gokarna:**",
-      "- Known for pristine beaches like Om Beach and Kudle Beach.",
-      "- A more peaceful alternative to Goa.",
-      "#### **C. Beaches and Coastal Destinations**",
-      "- **Udupi:**",
-      "- Famous for its temples, beaches, and coastal cuisine.",
-      "- Malpe Beach is popular for water sports.",
-      "- **Karwar:**",
-      "- Known for its serene beaches and the peaceful atmosphere.",
-      "- Rabindranath Tagore Beach and Devbagh Beach are major attractions.",
-      "- **Kundapur:**",
-      "- Offers beautiful, less crowded beaches like Kodi Beach.",
-      "#### **D. Wildlife and Nature Reserves**",
-      "- **Bandipur National Park:**",
-      "- A major wildlife sanctuary in Karnataka, home to tigers, elephants, and a variety of flora and fauna.",
-      "- **Nagarhole National Park:**",
-      "- Known for its rich biodiversity and picturesque landscapes.",
-      "- **Bhadra Wildlife Sanctuary:**",
-      "- Home to tigers, leopards, and other wildlife.",
-      "- Located in the Western Ghats.",
-      "---",
-      "### 3. **Other Noteworthy Locations**",
-      "- **Kudremukh:**",
-      "- Famous for trekking and its stunning views from the Kudremukh peak.",
-      "- **Ramanagaram:**",
-      "- Known as the \"Silk City\" and \"Rock Climbing Capital of India.\"",
-      "- The site of famous rock climbing spots and the location for the Bollywood film *Sholay*.",
-      "- **Belur and Halebidu:**",
-      "- Known for exquisite Hoysala architecture in temples like Chennakeshava and Hoysaleswara Temples.",
-      "---",
-      "### 4. **Suggestions for Future Development**",
-      "- **Promote Lesser-Known Locations:**",
-      "- Focus on promoting hidden gems like Agumbe, Gokarna, and Kudremukh to ease the crowding in popular tourist areas.",
-      "- **Sustainable Tourism:**",
-      "- Encourage eco-tourism, nature trails, and conservation programs in areas like Agumbe and Kabini.",
-      "- Promote responsible tourism to preserve Karnataka\u00e2\u20ac\u2122s natural beauty and cultural heritage.",
-      "---",
-      "### 5. **Conclusion**",
-      "- Karnataka offers a wide range of destinations catering to diverse interests: history, nature, beaches, wildlife, and more.",
-      "- There is an opportunity to further develop and promote lesser-known places while maintaining sustainable tourism practices.",
-      "---",
-      "**Action Items:**",
-      "- Research feasibility for eco-tourism projects in lesser-known regions.",
-      "- Develop promotional materials highlighting Karnataka\u00e2\u20ac\u2122s diverse tourist spots.",
-      "- Explore partnerships with local tourism boards to boost awareness of the state's attractions.",
-      "---",
-      "**End of Meeting Notes.**"
+{
+  "timestamp": 1736954586.489041,
+  "metadata": {
+    "date": "December 27, 2024",
+    "time": "2:00 PM \u00e2\u20ac\u201c 3:00 PM",
+    "location": "Zoom Meeting",
+    "attendees": [
+      "Jane Doe (Project Manager)",
+      "John Smith (Senior Developer)",
+      "Alice Brown (UI/UX Designer)",
+      "Mark Lee (Marketing Lead)",
+      "Sarah White (QA Lead)"
     ],
-    "metadata": {}
-  }
-]
+    "next_meeting": "January 3, 2025 \u00e2\u20ac\u201c 2:00 PM (Zoom)"
+  },
+  "sections": [
+    {
+      "title": "Project Progress Update",
+      "points": [
+        {
+          "header": "**Jane Doe** provided a general update on the current status of the project.",
+          "sub_points": []
+        },
+        "Key milestones have been met:",
+        "Phase 1 (Research & Planning) completed.",
+        "Phase 2 (Prototype Development) in progress, 80% complete.",
+        "Some minor delays due to external dependencies, expected to finish within the next week."
+      ]
+    },
+    {
+      "title": "Design Feedback",
+      "points": [
+        {
+          "header": "**Alice Brown** shared new UI/UX designs for the mobile app interface.",
+          "sub_points": []
+        },
+        "Feedback from stakeholders:",
+        "Positive response to the color scheme and general layout.",
+        "Need to improve navigation flow, especially for first-time users.",
+        {
+          "header": "**Action Item**: Alice to revise the design based on feedback and send the updated version by EOD Friday.",
+          "sub_points": []
+        }
+      ]
+    },
+    {
+      "title": "Technical Issues & Development Progress",
+      "points": [
+        {
+          "header": "**John Smith** raised concerns regarding the integration of third-party API for the payment gateway.",
+          "sub_points": []
+        },
+        "Issue with the API documentation clarity, some features are not well-documented.",
+        "Proposed action: **John** will reach out to the third-party vendor for clarification and support.",
+        {
+          "header": "**Action Item**: John to schedule a meeting with the vendor by Friday, December 29th.",
+          "sub_points": []
+        }
+      ]
+    },
+    {
+      "title": "Marketing Strategy for Launch",
+      "points": [
+        {
+          "header": "**Mark Lee** presented the marketing plan for the product launch.",
+          "sub_points": []
+        },
+        "Focus on digital channels (social media, email marketing, influencer partnerships).",
+        "Special attention to be given to the upcoming holiday season for maximum engagement.",
+        {
+          "header": "**Action Item**: Mark to prepare the social media content calendar and share it with the team by next week.",
+          "sub_points": []
+        }
+      ]
+    },
+    {
+      "title": "Quality Assurance (QA) and Testing",
+      "points": [
+        {
+          "header": "**Sarah White** discussed the current testing progress.",
+          "sub_points": []
+        },
+        "The QA team has identified some minor bugs in the latest build, mostly related to user login.",
+        "Plan: Continue testing and escalate critical issues to the development team within 24 hours.",
+        {
+          "header": "**Action Item**: Sarah to ensure all test cases are updated in the system by next Tuesday.",
+          "sub_points": []
+        }
+      ]
+    },
+    {
+      "title": "Budget Review",
+      "points": [
+        {
+          "header": "**Jane Doe** highlighted the budget status.",
+          "sub_points": []
+        },
+        "The project is within budget, but some additional funds may be needed for unforeseen expenses related to API integration.",
+        {
+          "header": "**Action Item**: Jane to submit a revised budget request by the end of next week.",
+          "sub_points": []
+        },
+        "Revised UI design to be sent by Alice by Friday.",
+        "John to contact API vendor for clarifications.",
+        "Marketing content calendar to be finalized by Mark by next week.",
+        "QA team to continue testing and prioritize critical bugs."
+      ]
+    },
+    {
+      "title": "Decisions Made",
+      "points": [
+        "Revised UI design to be sent by Alice by Friday.",
+        "John to contact API vendor for clarifications.",
+        "Marketing content calendar to be finalized by Mark by next week.",
+        "QA team to continue testing and prioritize critical bugs."
+      ]
+    },
+    {
+      "title": "Action Items",
+      "points": [
+        "**Alice Brown** : Revise UI design and send by Friday, December 29th.",
+        "**John Smith** : Contact API vendor for clarification on documentation and set up a meeting by Friday.",
+        "**Mark Lee** : Prepare and share marketing content calendar by January 3rd.",
+        "**Sarah White** : Ensure all test cases are updated and report progress by next Tuesday, January 2nd.",
+        "**Jane Doe** : Submit a revised budget request by January 5th."
+      ]
+    }
+  ],
+  "format_version": "1.0"
+}
