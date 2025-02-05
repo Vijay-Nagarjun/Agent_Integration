@@ -150,12 +150,14 @@ class SliteAPI:
     async def __aenter__(self):
         """Async context manager entry"""
         # Initialize session with auth header
+        timeout = aiohttp.ClientTimeout(total=30)  # 30 seconds timeout
         self.session = aiohttp.ClientSession(
             headers={
                 "Authorization": f"Bearer {self.api_key}",
                 "Content-Type": "application/json",
                 "Accept": "application/json"
-            }
+            },
+            timeout=timeout
         )
         return self
 
@@ -253,26 +255,16 @@ class SliteAPI:
     async def create_folder(self, name: str, description: str = "") -> Dict:
         """Create a new folder"""
         try:
+            logger.info(f"Creating folder '{name}'")
             data = {
                 "title": name,
-                "markdown": f"# {name}\n\n{description}\n\n---\nThis is a folder for organizing content.",
-                "type": "folder",
-                "isFolder": True
+                "description": description,
+                "type": "folder"
             }
-            
             response = await self._make_request("POST", "/v1/notes", json=data)
-            
-            # Ensure we have the folder ID
-            if not response.get('id'):
-                logger.warning("Created folder but ID not found in response")
-                
-            logger.info(f"Successfully created folder: {name}")
-            
-            # Trigger event handlers
             self.events.trigger_folder_created(response)
-            
+            logger.info(f"Successfully created folder: {name}")
             return response
-            
         except Exception as e:
             logger.error(f"Error creating folder: {str(e)}")
             raise
@@ -291,13 +283,14 @@ class SliteAPI:
     async def rename_folder(self, folder_id: str, new_name: str) -> Dict:
         """Rename a folder"""
         try:
+            logger.info(f"Renaming folder {folder_id} to {new_name}")
             data = {
                 "title": new_name
             }
             response = await self._make_request("PUT", f"/v1/notes/{folder_id}", json=data)
-            logger.info(f"Successfully renamed folder {folder_id} to '{new_name}'")
+            self.events.trigger_folder_updated(response)
+            logger.info(f"Successfully renamed folder to: {new_name}")
             return response
-            
         except Exception as e:
             logger.error(f"Error renaming folder: {str(e)}")
             raise
@@ -380,24 +373,53 @@ class SliteAPI:
     async def delete_document(self, doc_id: str) -> Dict:
         """Delete a document"""
         try:
-            response = await self._make_request("DELETE", f"/v1/notes/{doc_id}")
-            logger.info(f"Successfully deleted document {doc_id}")
-            return response
+            logger.info(f"Deleting document {doc_id}")
             
+            # First verify the note exists
+            try:
+                note = await self._make_request("GET", f"/v1/notes/{doc_id}")
+                if not note:
+                    return {"status": "error", "message": f"Document {doc_id} not found"}
+            except Exception as e:
+                if "404" in str(e):
+                    return {"status": "error", "message": f"Document {doc_id} not found"}
+                raise
+
+            # Delete the note
+            response = await self._make_request("DELETE", f"/v1/notes/{doc_id}")
+            
+            # For successful deletion (204 No Content)
+            if response is None or not response:
+                logger.info(f"Document {doc_id} deleted successfully")
+                return {"status": "success", "message": f"Document {doc_id} deleted successfully"}
+            
+            return response
         except Exception as e:
-            logger.error(f"Error deleting document: {str(e)}")
-            raise
+            error_msg = str(e)
+            logger.error(f"Error deleting document: {error_msg}")
+            if "404" in error_msg:
+                return {"status": "error", "message": f"Document {doc_id} not found"}
+            raise Exception(f"Failed to delete document: {error_msg}")
 
     async def rename_document(self, doc_id: str, new_title: str) -> Dict:
         """Rename a document"""
         try:
-            data = {
-                "title": new_title
-            }
-            response = await self._make_request("PUT", f"/v1/notes/{doc_id}", json=data)
-            logger.info(f"Successfully renamed document {doc_id} to '{new_title}'")
-            return response
+            logger.info(f"Renaming document {doc_id} to {new_title}")
             
+            # Get current document to preserve content
+            current_doc = await self.get_note_async(doc_id)
+            if not current_doc:
+                raise Exception(f"Document {doc_id} not found")
+            
+            data = {
+                "title": new_title,
+                "markdown": current_doc.get('markdown', '')  # Preserve existing content
+            }
+            
+            response = await self._make_request("PUT", f"/v1/notes/{doc_id}", json=data)
+            self.events.trigger_document_updated(response)
+            logger.info(f"Successfully renamed document to: {new_title}")
+            return response
         except Exception as e:
             logger.error(f"Error renaming document: {str(e)}")
             raise
@@ -465,6 +487,180 @@ class SliteAPI:
             
         except Exception as e:
             logger.error(f"Error formatting meeting notes: {str(e)}")
+            raise
+
+    async def search_notes_async(self, query: str) -> List[Dict]:
+        """Search for notes asynchronously"""
+        try:
+            logger.info(f"Searching notes with query: {query}")
+            response = await self._make_request(
+                "GET", 
+                "/v1/search-notes",
+                params={
+                    "query": query,
+                    "type": "note",  # Only search for notes
+                    "hitsPerPage": 10  # Increase hits to find exact match
+                }
+            )
+            
+            # Extract hits from response
+            if isinstance(response, dict):
+                hits = response.get('hits', [])
+            else:
+                hits = response if isinstance(response, list) else []
+            
+            logger.info(f"Found {len(hits)} matching notes")
+            return hits
+            
+        except Exception as e:
+            logger.error(f"Error searching notes: {str(e)}")
+            raise
+
+    async def create_note_async(self, title: str, content: str, parent_note_id: str = None) -> Dict:
+        """Create a note asynchronously"""
+        data = {
+            "title": title,
+            "markdown": content
+        }
+        if parent_note_id:
+            data["parentNoteId"] = parent_note_id
+            
+        logger.info(f"Creating note '{title}' with content length {len(content)}")
+        response = await self._make_request("POST", "/v1/notes", json=data)
+        self.events.trigger_document_created(response)
+        return response
+
+    async def get_note_async(self, note_id: str) -> Dict:
+        """Get a note by ID asynchronously"""
+        response = await self._make_request("GET", f"/v1/notes/{note_id}")
+        # Extract markdown content from response
+        if isinstance(response.get('content'), dict):
+            response['markdown'] = response['content'].get('markdown', '')
+        return response
+
+    async def update_note_async(self, note_id: str, content: str, append: bool = False) -> Dict:
+        """Update a note asynchronously"""
+        try:
+            original_input = note_id
+            logger.info(f"Updating note {note_id}")
+            
+            # If note_id doesn't look like a Slite ID and doesn't contain special characters,
+            # try to find it by title
+            if not note_id.startswith('n_') and note_id.replace(' ', '').isalnum():
+                logger.info(f"Input looks like a title, searching for note: {note_id}")
+                search_results = await self.search_notes_async(note_id)
+                if not search_results:
+                    raise Exception(f"Could not find note with title: {note_id}")
+                
+                # Find exact title match
+                for note in search_results:
+                    if note.get('title', '').lower() == note_id.lower():
+                        note_id = note.get('id')
+                        logger.info(f"Found exact match with ID: {note_id}")
+                        break
+                else:
+                    # If no exact match, use first result
+                    note_id = search_results[0].get('id')
+                    logger.info(f"Using best match with ID: {note_id}")
+                
+                if not note_id:
+                    raise Exception(f"Could not find note ID for title: {original_input}")
+
+            # Get existing note content if appending
+            existing_content = ""
+            if append:
+                try:
+                    note = await self.get_note_async(note_id)
+                    if note and 'content' in note:
+                        existing_content = note['content'] + "\n\n"
+                except Exception as e:
+                    logger.warning(f"Could not get existing content for append: {str(e)}")
+
+            # Prepare the update payload with proper structure
+            update_payload = {
+                "title": original_input,  # Keep original title
+                "markdown": existing_content + content if append else content
+            }
+
+            # Make the update request
+            response = await self._make_request(
+                "PUT",  # Using PUT instead of PATCH
+                f"/v1/notes/{note_id}",
+                json=update_payload
+            )
+
+            if response:
+                logger.info(f"Successfully updated note {note_id}")
+                return {"status": "success", "data": response}
+            else:
+                raise Exception(f"Failed to update note {original_input}")
+
+        except Exception as e:
+            logger.error(f"Error updating note: {str(e)}")
+            return {"status": "error", "message": str(e)}
+
+    async def delete_note_async(self, note_id: str) -> Dict:
+        """Delete a note by ID asynchronously"""
+        try:
+            logger.info(f"Deleting note {note_id}")
+            
+            # First verify the note exists
+            try:
+                note = await self._make_request("GET", f"/v1/notes/{note_id}")
+                if not note:
+                    return {"status": "error", "message": f"Note {note_id} not found"}
+            except Exception as e:
+                if "404" in str(e):
+                    return {"status": "error", "message": f"Note {note_id} not found"}
+                raise
+
+            # Delete the note
+            response = await self._make_request("DELETE", f"/v1/notes/{note_id}")
+            
+            # For successful deletion (204 No Content)
+            if response is None or not response:
+                logger.info(f"Note {note_id} deleted successfully")
+                return {"status": "success", "message": f"Note {note_id} deleted successfully"}
+            
+            return response
+        except Exception as e:
+            error_msg = str(e)
+            logger.error(f"Error deleting note: {error_msg}")
+            if "404" in error_msg:
+                return {"status": "error", "message": f"Note {note_id} not found"}
+            raise Exception(f"Failed to delete note: {error_msg}")
+
+    async def search_folder_by_name(self, folder_name: str) -> Optional[Dict]:
+        """Search for a folder by name"""
+        try:
+            logger.info(f"Searching for folder: {folder_name}")
+            response = await self._make_request(
+                "GET", 
+                "/v1/search-notes", 
+                params={
+                    "q": folder_name,
+                    "type": "folder"
+                }
+            )
+            
+            # Extract hits from response
+            hits = []
+            if isinstance(response, dict):
+                hits = response.get('hits', [])
+            else:
+                hits = response if isinstance(response, list) else []
+            
+            # Look for exact match
+            for hit in hits:
+                if hit.get('title', '').lower() == folder_name.lower():
+                    logger.info(f"Found folder: {folder_name}")
+                    return hit
+            
+            logger.info(f"No folder found with name: {folder_name}")
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error searching for folder: {str(e)}")
             raise
 
 if __name__ == "__main__":
