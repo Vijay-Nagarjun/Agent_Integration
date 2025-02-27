@@ -4,7 +4,7 @@ import asyncio
 from datetime import datetime
 from typing import List, Dict, Any, Optional
 from functools import partial
-from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_openai import ChatOpenAI
 from langchain.agents import AgentType, initialize_agent, Tool
 from langchain.memory import ConversationSummaryBufferMemory
 from langchain.prompts import MessagesPlaceholder
@@ -26,7 +26,8 @@ class SliteTools:
         self.api = api
         self._last_note_id = None  # Store the ID of the last created/accessed note
         self._last_folder_id = None  # Store the ID of the last created/accessed folder
-        
+        self._existing_notes_cache = {}  # Add cache initialization
+
     @property
     def last_note_id(self):
         """Get the ID of the last created/accessed note"""
@@ -36,6 +37,134 @@ class SliteTools:
     def last_folder_id(self):
         """Get the ID of the last created/accessed folder"""
         return self._last_folder_id
+
+    def _sanitize_content(self, content: str) -> str:
+        """Sanitize and format content for Slite API"""
+        if not content:
+            return ""
+        content = content.replace('\x00', '')
+        content = content.replace('\r\n', '\n').replace('\r', '\n')
+        if not content.endswith('\n'):
+            content += '\n'
+        return content
+
+    async def _find_existing_note(self, title: str) -> Optional[Dict[str, Any]]:
+        """Find existing note by title"""
+        try:
+            search_results = await self.api.search_notes_async(title)
+            if search_results:
+                for note in search_results:
+                    if note.get('title', '').lower() == title.lower():
+                        return note
+            return None
+        except Exception as e:
+            logger.error(f"Error finding existing note: {str(e)}")
+            return None
+
+    async def _get_note_content(self, note_id: str) -> Optional[str]:
+        """Get note content with caching"""
+        try:
+            if (note_id in self._existing_notes_cache):
+                return self._existing_notes_cache[note_id]['content']
+            
+            note = await self.api.get_note_async(note_id)
+            if note:
+                self._existing_notes_cache[note_id] = {
+                    'content': note.get('markdown', ''),
+                    'title': note.get('title', '')
+                }
+                return note.get('markdown', '')
+            return None
+        except Exception as e:
+            logger.error(f"Error getting note content: {str(e)}")
+            return None
+        
+    async def update_or_create_note(self, title: str, content: str, append: bool = False) -> str:
+        """Update existing note or create new one if doesn't exist"""
+        try:
+            # Ensure API session is active
+            if not self.api._session_active:
+                await self.api.__aenter__()
+                
+            content = self._sanitize_content(content)
+            
+            # First try to find the exact note by title
+            existing_note = await self._find_existing_note(title)
+            
+            if existing_note:
+                note_id = existing_note['id']
+                logger.info(f"Found existing note with title '{title}' (ID: {note_id})")
+
+                # Get existing content if appending
+                if append:
+                    existing_content = await self._get_note_content(note_id)
+                    if existing_content:
+                        content = f"{existing_content.rstrip()}\n\n{content}"
+
+                # Update the note using the note ID
+                result = await self.api.update_note_async(
+                    note_id=note_id,
+                    content=content,
+                    append=append
+                )
+
+                if result and result.get("status") == "success":
+                    self._last_note_id = note_id
+                    self._existing_notes_cache[note_id] = {
+                        'content': content,
+                        'title': title
+                    }
+                    
+                    return json.dumps({
+                        "status": "success",
+                        "message": f"Successfully {'appended to' if append else 'updated'} note: {title}",
+                        "note_id": note_id,
+                        "action": "updated"
+                    }, indent=2)
+            else:
+                # Create new note
+                logger.info(f"Note with title '{title}' not found, creating new note")
+                result = await self.api.create_note_async(
+                    title=title,
+                    content=content
+                )
+                
+                if result:
+                    self._last_note_id = result.get('id')
+                    return json.dumps({
+                        "status": "success",
+                        "message": f"Created new note: {title}",
+                        "note_id": result.get('id'),
+                        "action": "created"
+                    }, indent=2)
+
+            return json.dumps({
+                "status": "error",
+                "message": "Failed to update or create note"
+            }, indent=2)
+
+        except Exception as e:
+            error_msg = str(e)
+            logger.error(f"Error in update_or_create_note: {error_msg}")
+            logger.error(traceback.format_exc())
+            return json.dumps({
+                "status": "error", 
+                "message": f"Error updating/creating note: {error_msg}",
+                "details": traceback.format_exc()
+            }, indent=2)
+
+    async def process_multiline_input(self) -> str:
+        """Process multiline input from terminal"""
+        print("Enter/paste your content. Press Ctrl+D (Unix) or Ctrl+Z (Windows) on a new line to finish:")
+        content_lines = []
+        try:
+            while True:
+                line = input()
+                content_lines.append(line)
+        except EOFError:
+            pass
+        
+        return '\n'.join(content_lines)
 
     async def create_note(self, title: str, content: str, tags: Optional[List[str]] = None) -> str:
         """Create a new note"""
@@ -62,24 +191,51 @@ class SliteTools:
     async def update_note(self, note_id: str, content: str, append: bool = False) -> str:
         """Update or append to an existing note."""
         try:
-            # Update the note
-            result = await self.api.update_note_async(note_id, content, append)
+            # Sanitize content
+            content = self._sanitize_content(content)
+            
+            # Get existing note content if appending
+            if append:
+                existing_content = await self._get_note_content(note_id)
+                if existing_content:
+                    content = f"{existing_content.rstrip()}\n\n{content}"
+
+            # Format the update payload according to Slite API specs
+            update_payload = {
+                "markdown": content,  # Use markdown format for content
+                "attributes": []  # Keep any existing attributes
+            }
+
+            # Update the note using PUT request
+            result = await self.api.update_note_async(
+                note_id=note_id,
+                content=update_payload["markdown"],
+                append=append
+            )
             
             if result.get("status") == "error":
                 return json.dumps(result, indent=2)
             
+            # Update cache
+            self._existing_notes_cache[note_id] = {
+                'content': content,
+                'title': result.get('title', '')
+            }
+            
             return json.dumps({
                 "status": "success",
-                "message": f"Successfully updated note {note_id}",
-                "data": result.get("data", {})
+                "message": f"Successfully {'appended to' if append else 'updated'} note {note_id}",
+                "data": result
             }, indent=2)
             
         except Exception as e:
             error_msg = str(e)
             logger.error(f"Error updating note: {error_msg}")
+            logger.error(traceback.format_exc())
             return json.dumps({
                 "status": "error",
-                "message": f"Error updating note: {error_msg}"
+                "message": f"Error updating note: {error_msg}",
+                "details": traceback.format_exc()
             }, indent=2)
 
     async def summarize_note(self, note_id: str) -> str:
@@ -189,29 +345,58 @@ class SliteTools:
         try:
             folder_id = None
             
-            # If folder_name provided, search for existing folder
             if folder_name:
-                folder = await self.api.search_folder_by_name(folder_name)
-                if folder:
-                    folder_id = folder.get('id')
-                    logger.info(f"Found existing folder: {folder_name} with ID: {folder_id}")
-                else:
-                    # Create new folder if not found
-                    logger.info(f"Folder not found, creating new folder: {folder_name}")
-                    folder_result = await self.api.create_folder(name=folder_name)
-                    folder_id = folder_result.get('id')
-            else:
-                # Use last created folder if no folder name provided
-                folder_id = self._last_folder_id
+                # First try to find the folder in cache
+                for fid, data in self._existing_notes_cache.items():
+                    if data.get('type') == 'folder' and data.get('title', '').lower() == folder_name.lower():
+                        folder_id = fid
+                        logger.info(f"Found folder in cache: {folder_name} with ID: {folder_id}")
+                        break
+
+                # If not in cache, search for existing folder
+                if not folder_id:
+                    folder = await self.api.search_folder_by_name(folder_name)
+                    if folder:
+                        folder_id = folder.get('id')
+                        # Add to cache
+                        self._existing_notes_cache[folder_id] = {
+                            'title': folder_name,
+                            'type': 'folder'
+                        }
+                        logger.info(f"Found existing folder: {folder_name} with ID: {folder_id}")
+                    else:
+                        # Create new folder if not found
+                        logger.info(f"Creating new folder: {folder_name}")
+                        folder_result = await self.api.create_folder(name=folder_name)
+                        folder_id = folder_result.get('id')
+                        # Cache the new folder
+                        self._last_folder_id = folder_id
+                        self._existing_notes_cache[folder_id] = {
+                            'title': folder_name,
+                            'type': 'folder'
+                        }
             
             # Create note in the folder
-            result = await self.api.create_note_async(title=title, content=content, parent_note_id=folder_id)
+            logger.info(f"Creating note '{title}' in folder '{folder_name}' (ID: {folder_id})")
+            result = await self.api.create_note_async(
+                title=title, 
+                content=content, 
+                parent_note_id=folder_id
+            )
+            
             if result and isinstance(result, dict):
                 self._last_note_id = result.get('id')
-            return json.dumps({"status": "success", "note": result}, indent=2)
+                return json.dumps({"status": "success", "note": result}, indent=2)
+                
+            return json.dumps({"status": "error", "message": "Failed to create note"}, indent=2)
+            
         except Exception as e:
-            logger.error(f"Error creating note in folder: {str(e)}")
-            return f"Error creating note in folder: {str(e)}"
+            error_msg = str(e)
+            logger.error(f"Error creating note in folder: {error_msg}")
+            return json.dumps({
+                "status": "error",
+                "message": f"Error creating note in folder: {error_msg}"
+            }, indent=2)
 
     async def rename_folder(self, folder_name: str, new_name: str) -> str:
         """Rename a folder"""
@@ -292,21 +477,20 @@ class RenameNoteInput(BaseModel):
 class SliteAgent:
     """LangChain agent for interacting with Slite with enhanced features"""
 
-    def __init__(self, api_key: str, gemini_api_key: str = None):
+    def __init__(self, api_key: str, openai_api_key: str = None):
         """Initialize the SliteAgent with API keys and tools"""
         self.api_key = api_key
-        self.gemini_api_key = gemini_api_key or os.getenv("GEMINI_API_KEY")
-        if not self.gemini_api_key:
-            raise ValueError("Gemini API key must be provided")
+        self.openai_api_key = openai_api_key or os.getenv("OPENAI_API_KEY")
+        if not self.openai_api_key:
+            raise ValueError("OpenAI API key must be provided")
         
-        self.api = None
+        self.api = SliteAPI(self.api_key)
         self.tools = None
         self.memory = ConversationSummaryBufferMemory(
-            llm=ChatGoogleGenerativeAI(
-                model="gemini-pro",
+            llm=ChatOpenAI(
+                model="gpt-3.5-turbo",
                 temperature=0,
-                google_api_key=self.gemini_api_key,
-                convert_system_message_to_human=True
+                api_key=self.openai_api_key
             ),
             max_token_limit=500,
             memory_key="chat_history",
@@ -314,181 +498,257 @@ class SliteAgent:
         )
         
         self.agent_executor = None
-        
+        self._session_initialized = False
+        self._session_in_use = False
+        self._keep_session_alive = True
+        self._force_cleanup = False
+
+    async def _ensure_session(self):
+        """Ensure API session is initialized"""
+        await self.api.ensure_session()
+        self._session_initialized = True
+
+    async def _release_session(self):
+        """Release but don't close the session"""
+        self._session_in_use = False
+
     async def initialize_agent(self):
         """Initialize the agent with tools and memory"""
-        if not self.agent_executor:
-            # Initialize API and tools
-            self.api = SliteAPI(self.api_key)
-            await self.api.__aenter__()
-            self.tools = SliteTools(self.api)
-            
-            # Create tools list
-            tools = [
-                StructuredTool.from_function(
-                    func=self.tools.search_notes,
-                    name="SearchNotes",
-                    description="Search for notes using a query.",
-                    args_schema=SearchNotesInput,
-                    coroutine=self.tools.search_notes
-                ),
-                StructuredTool.from_function(
-                    func=self.tools.create_note,
-                    name="CreateNote",
-                    description="Create a new note with title, content, and optional tags.",
-                    args_schema=CreateNoteInput,
-                    coroutine=self.tools.create_note
-                ),
-                StructuredTool.from_function(
-                    func=self.tools.update_note,
-                    name="UpdateNote",
-                    description="Update or append to an existing note.",
-                    args_schema=UpdateNoteInput,
-                    coroutine=self.tools.update_note
-                ),
-                StructuredTool.from_function(
-                    func=self.tools.summarize_note,
-                    name="SummarizeNote",
-                    description="Generate a summary of a note's content.",
-                    args_schema=SummarizeNoteInput,
-                    coroutine=self.tools.summarize_note
-                ),
-                StructuredTool.from_function(
-                    func=self.tools.delete_note,
-                    name="DeleteNote",
-                    description="Delete a note by ID or title.",
-                    args_schema=DeleteNoteInput,
-                    coroutine=self.tools.delete_note
-                ),
-                StructuredTool.from_function(
-                    func=self.tools.create_folder,
-                    name="CreateFolder",
-                    description="Create a new folder.",
-                    args_schema=CreateFolderInput,
-                    coroutine=self.tools.create_folder
-                ),
-                StructuredTool.from_function(
-                    func=self.tools.create_note_in_folder,
-                    name="CreateNoteInFolder",
-                    description="Create a new note in a specific folder with title, content, and optional tags.",
-                    args_schema=CreateNoteInFolderInput,
-                    coroutine=self.tools.create_note_in_folder
-                ),
-                StructuredTool.from_function(
-                    func=self.tools.rename_folder,
-                    name="RenameFolder",
-                    description="Rename a folder.",
-                    args_schema=RenameFolderInput,
-                    coroutine=self.tools.rename_folder
-                ),
-                StructuredTool.from_function(
-                    func=self.tools.rename_note,
-                    name="RenameNote",
-                    description="Rename a note.",
-                    args_schema=RenameNoteInput,
-                    coroutine=self.tools.rename_note
-                )
-            ]
-            
-            system_prompt = """You are a helpful assistant that manages notes and folders in Slite.
-            
-            Available tools:
-            1. SearchNotes:
-               - Search for notes using keywords
-               Example: {"query": "meeting notes"}
-            
-            2. UpdateNote:
-               - Update or append content to an existing note
-               Example: {"note_id": "123", "content": "New content", "append": false}
-            
-            3. DeleteNote:
-               - Delete a note by ID or title
-               Example: {"note_id": "123"}
-            
-            4. CreateFolder:
-               - Create a new folder with a given name and optional description
-               Example: {"name": "New Folder", "description": "This is a new folder"}
-            
-            5. CreateNoteInFolder:
-               - Create a new note in a specific folder with title, content, and optional tags
-               Example: {"title": "New Note", "content": "This is a new note", "folder_name": "Existing Folder", "tags": ["tag1", "tag2"]}
-            
-            6. RenameFolder:
-               - Rename a folder
-               Example: {"folder_name": "Old Folder", "new_name": "New Folder"}
-            
-            7. RenameNote:
-               - Rename a note
-               Example: {"note_title": "Old Note", "new_title": "New Note"}
-            
-            When the user asks to:
-            1. Create a document in a folder:
-               - First check if the folder exists using the folder name
-               - If it exists, create the note in that folder
-               - If it doesn't exist, create the folder first, then create the note
-            
-            2. "Add content" or "update" a note:
-               - Use UpdateNote with append=true on the existing note
-               - If no note ID provided, use the last accessed note
-            
-            3. "Delete" a note:
-               - Use DeleteNote on the specified note
-               - If no note ID provided, use the last accessed note
-               - Confirm the deletion was successful
-            
-            4. "Create a new folder":
-               - Use CreateFolder to create a new folder with a given name and optional description
-               
-            5. "Create a new note in a folder":
-               - Use CreateNoteInFolder to create a new note in a specific folder
-               - Specify the folder name, not the ID
-               - The folder will be found or created automatically
-            
-            6. "Rename a folder":
-               - Use RenameFolder to rename a folder
-            
-            7. "Rename a note":
-               - Use RenameNote to rename a note"""
-            
-            human_message = HumanMessagePromptTemplate.from_template("{input}\n\nCurrent conversation:\n{agent_scratchpad}")
-            chat_prompt = ChatPromptTemplate.from_messages([
-                SystemMessagePromptTemplate.from_template(system_prompt),
-                MessagesPlaceholder(variable_name="chat_history"),
-                human_message
-            ])
+        try:
+            if not self.agent_executor:
+                # Initialize API session
+                await self._ensure_session()
+                
+                # Initialize tools
+                self.tools = SliteTools(self.api)
+                
+                # Create tools list
+                tools = [
+                    StructuredTool.from_function(
+                        func=self.tools.search_notes,
+                        name="SearchNotes",
+                        description="Search for notes using a query.",
+                        args_schema=SearchNotesInput,
+                        coroutine=self.tools.search_notes
+                    ),
+                    StructuredTool.from_function(
+                        func=self.tools.create_note,
+                        name="CreateNote",
+                        description="Create a new note with title, content, and optional tags.",
+                        args_schema=CreateNoteInput,
+                        coroutine=self.tools.create_note
+                    ),
+                    StructuredTool.from_function(
+                        func=self.tools.update_note,
+                        name="UpdateNote",
+                        description="Update or append to an existing note.",
+                        args_schema=UpdateNoteInput,
+                        coroutine=self.tools.update_note
+                    ),
+                    StructuredTool.from_function(
+                        func=self.tools.summarize_note,
+                        name="SummarizeNote",
+                        description="Generate a summary of a note's content.",
+                        args_schema=SummarizeNoteInput,
+                        coroutine=self.tools.summarize_note
+                    ),
+                    StructuredTool.from_function(
+                        func=self.tools.delete_note,
+                        name="DeleteNote",
+                        description="Delete a note by ID or title.",
+                        args_schema=DeleteNoteInput,
+                        coroutine=self.tools.delete_note
+                    ),
+                    StructuredTool.from_function(
+                        func=self.tools.create_folder,
+                        name="CreateFolder",
+                        description="Create a new folder.",
+                        args_schema=CreateFolderInput,
+                        coroutine=self.tools.create_folder
+                    ),
+                    StructuredTool.from_function(
+                        func=self.tools.create_note_in_folder,
+                        name="CreateNoteInFolder",
+                        description="Create a new note in a specific folder with title, content, and optional tags.",
+                        args_schema=CreateNoteInFolderInput,
+                        coroutine=self.tools.create_note_in_folder
+                    ),
+                    StructuredTool.from_function(
+                        func=self.tools.rename_folder,
+                        name="RenameFolder",
+                        description="Rename a folder.",
+                        args_schema=RenameFolderInput,
+                        coroutine=self.tools.rename_folder
+                    ),
+                    StructuredTool.from_function(
+                        func=self.tools.rename_note,
+                        name="RenameNote",
+                        description="Rename a note.",
+                        args_schema=RenameNoteInput,
+                        coroutine=self.tools.rename_note
+                    )
+                ]
+                
+                system_prompt = """You are a helpful assistant that manages notes and folders in Slite.
+                
+                Available tools:
+                1. SearchNotes:
+                   - Search for notes using keywords
+                   Example: {"query": "meeting notes"}
+                
+                2. UpdateNote:
+                   - Update or append content to an existing note
+                   Example: {"note_id": "123", "content": "New content", "append": false}
+                
+                3. DeleteNote:
+                   - Delete a note by ID or title
+                   Example: {"note_id": "123"}
+                
+                4. CreateFolder:
+                   - Create a new folder with a given name and optional description
+                   Example: {"name": "New Folder", "description": "This is a new folder"}
+                
+                5. CreateNoteInFolder:
+                   - Create a new note in a specific folder with title, content, and optional tags
+                   Example: {"title": "New Note", "content": "This is a new note", "folder_name": "Existing Folder", "tags": ["tag1", "tag2"]}
+                
+                6. RenameFolder:
+                   - Rename a folder
+                   Example: {"folder_name": "Old Folder", "new_name": "New Folder"}
+                
+                7. RenameNote:
+                   - Rename a note
+                   Example: {"note_title": "Old Note", "new_title": "New Note"}
+                
+                When the user asks to:
+                1. Create a document in a folder:
+                   - First check if the folder exists using the folder name
+                   - If it exists, create the note in that folder
+                   - If it doesn't exist, create the folder first, then create the note
+                
+                2. "Add content" or "update" a note:
+                   - Use UpdateNote with append=true on the existing note
+                   - If no note ID provided, use the last accessed note
+                
+                3. "Delete" a note:
+                   - Use DeleteNote on the specified note
+                   - If no note ID provided, use the last accessed note
+                   - Confirm the deletion was successful
+                
+                4. "Create a new folder":
+                   - Use CreateFolder to create a new folder with a given name and optional description
+                   
+                5. "Create a new note in a folder":
+                   - Use CreateNoteInFolder to create a new note in a specific folder
+                   - Specify the folder name, not the ID
+                   - The folder will be found or created automatically
+                
+                6. "Rename a folder":
+                   - Use RenameFolder to rename a folder
+                
+                7. "Rename a note":
+                   - Use RenameNote to rename a note"""
+                
+                human_message = HumanMessagePromptTemplate.from_template("{input}\n\nCurrent conversation:\n{agent_scratchpad}")
+                chat_prompt = ChatPromptTemplate.from_messages([
+                    SystemMessagePromptTemplate.from_template(system_prompt),
+                    MessagesPlaceholder(variable_name="chat_history"),
+                    human_message
+                ])
 
-            self.agent_executor = initialize_agent(
-                tools=tools,
-                llm=ChatGoogleGenerativeAI(
-                    model="gemini-pro",
-                    temperature=0,
-                    google_api_key=self.gemini_api_key,
-                    convert_system_message_to_human=True
-                ),
-                agent=AgentType.STRUCTURED_CHAT_ZERO_SHOT_REACT_DESCRIPTION,
-                verbose=True,
-                memory=self.memory,
-                agent_kwargs={
-                    "system_message": system_prompt,
-                    "input_variables": ["input", "agent_scratchpad", "chat_history"]
-                }
-            )
+                self.agent_executor = initialize_agent(
+                    tools=tools,
+                    llm=ChatOpenAI(
+                        model="gpt-3.5-turbo",
+                        temperature=0,
+                        api_key=self.openai_api_key
+                    ),
+                    agent=AgentType.STRUCTURED_CHAT_ZERO_SHOT_REACT_DESCRIPTION,
+                    verbose=True,
+                    memory=self.memory,
+                    agent_kwargs={
+                        "system_message": system_prompt,
+                        "input_variables": ["input", "agent_scratchpad", "chat_history"]
+                    }
+                )
+        except Exception as e:
+            logger.error(f"Error initializing agent: {str(e)}")
+            raise
     
     async def process_query(self, query: str) -> str:
         """Process a user query and return the response"""
-        if not self.agent_executor:
-            await self.initialize_agent()
-            
         try:
-            async with self.api:
-                response = await self.agent_executor.arun(
-                    input=query
+            await self._ensure_session()
+            
+            if not self.agent_executor:
+                await self.initialize_agent()
+            
+            # Check if this is an update operation
+            if query.lower().startswith("update") or query.lower().startswith("add content to"):
+                # Extract document title
+                title = query.split('"')[1] if '"' in query else query.split("update ")[-1].strip()
+                
+                # Prompt for content
+                print("\nEnter/paste your content (Press Ctrl+D on Unix or Ctrl+Z on Windows + Enter on a new line when done):")
+                content_lines = []
+                while True:
+                    try:
+                        line = input()
+                        content_lines.append(line)
+                    except EOFError:
+                        break
+                
+                content = "\n".join(content_lines)
+                
+                if not content.strip():
+                    return "No content provided. Update cancelled."
+                
+                # Search for the note and update it
+                result = await self.tools.update_or_create_note(
+                    title=title,
+                    content=content,
+                    append=False
                 )
+                
+                await self._release_session()  # Release but don't close session
+                return f"Document update result:\n{result}"
+            else:
+                # Handle other types of queries normally
+                response = await self.agent_executor.arun(input=query)
+                await self._release_session()  # Release but don't close session
                 return response
+                
         except Exception as e:
             logger.error(f"Error processing query: {str(e)}")
             logger.error(traceback.format_exc())
             return f"Error processing query: {str(e)}"
+
+    async def cleanup(self):
+        """Cleanup resources only when explicitly called"""
+        if self._force_cleanup:
+            await self.api.close(force=True)
+            self._session_initialized = False
+
+    async def close(self):
+        """Explicitly close the agent and its resources"""
+        self._keep_session_alive = False
+        self._force_cleanup = True
+        await self.cleanup()
+        self.api._force_cleanup = True
+        await self.api.close(force=True)
+
+    def __del__(self):
+        """Ensure cleanup on deletion"""
+        if self._session_initialized:
+            import asyncio
+            try:
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    loop.create_task(self.cleanup())
+                else:
+                    loop.run_until_complete(self.cleanup())
+            except Exception:
+                pass
 
 class SliteNoteManager:
     def __init__(self):
@@ -534,6 +794,7 @@ class SliteNoteManager:
             logger.error(f"Error searching notes: {str(e)}")
             raise
 
+# Update run_async function to handle cleanup
 def run_async(coro):
     """Run an async function in a synchronous context"""
     try:
@@ -541,4 +802,18 @@ def run_async(coro):
     except RuntimeError:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-    return loop.run_until_complete(coro)
+    
+    async def wrapped_coro():
+        agent = None
+        try:
+            if isinstance(coro, SliteAgent):
+                agent = coro
+                await agent._ensure_session()
+                return agent
+            else:
+                return await coro
+        finally:
+            if agent:
+                await agent.cleanup()
+    
+    return loop.run_until_complete(wrapped_coro())

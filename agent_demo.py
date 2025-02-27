@@ -28,8 +28,8 @@ class AgentDemo:
         logger.info("Initializing AgentDemo...")
         load_dotenv()
         
-        # Verify environment variables
-        required_vars = ["SLITE_API_KEY", "GEMINI_API_KEY"]
+        # Update required vars to check for OpenAI key
+        required_vars = ["SLITE_API_KEY", "OPENAI_API_KEY"]  # Changed from GEMINI_API_KEY
         missing_vars = [var for var in required_vars if not os.getenv(var)]
         if missing_vars:
             raise ValueError(f"Missing required environment variables: {', '.join(missing_vars)}")
@@ -42,11 +42,17 @@ class AgentDemo:
     async def initialize_agent(self):
         """Initialize the Slite agent and QA agent"""
         if not self.agent:
-            slite_api_key = os.getenv("SLITE_API_KEY")
-            gemini_api_key = os.getenv("GEMINI_API_KEY")
-            self.agent = SliteAgent(api_key=slite_api_key, gemini_api_key=gemini_api_key)
-            self.qa_agent = SliteQAAgent(gemini_api_key=gemini_api_key, slite_api_key=slite_api_key)
-            await self.agent.initialize_agent()
+            try:
+                slite_api_key = os.getenv("SLITE_API_KEY")
+                openai_api_key = os.getenv("OPENAI_API_KEY")  # Changed from gemini_api_key
+                
+                self.agent = SliteAgent(api_key=slite_api_key, openai_api_key=openai_api_key)  # Updated parameter name
+                await self.agent._ensure_session()
+                await self.agent.initialize_agent()
+                
+            except Exception as e:
+                logger.error(f"Error initializing agent: {str(e)}")
+                raise ValueError(f"Failed to initialize agent: {str(e)}")
 
     async def cleanup(self):
         """Cleanup resources"""
@@ -137,7 +143,7 @@ class AgentDemo:
                     logger.info("Exiting interactive mode")
                     break
                 elif query.lower() == 'help':
-                    print(help_text)
+                    print('help_text')
                 elif query.lower() == 'clear':
                     self.agent.memory.clear()
                     print("Conversation history cleared")
