@@ -19,6 +19,10 @@ import socket
 
 logger = logging.getLogger(__name__)
 
+class AuthenticationError(Exception):
+    """Custom exception for authentication related errors"""
+    pass
+
 class SliteEventHandler:
     """
     Event handler for Slite operations.
@@ -97,41 +101,35 @@ class SliteEventHandler:
                 logger.error(f"Error in document updated handler: {str(e)}")
 
 class BatchProcessor:
-    """Handle batch operations for API requests"""
+    """Handle batch operations with dynamic sizing"""
     
-    def __init__(self, batch_size: int = 10, max_concurrent: int = 5):
-        self.batch_size = batch_size
-        self.max_concurrent = max_concurrent
-        self.queue = asyncio.Queue()
-        self.semaphore = asyncio.Semaphore(max_concurrent)
+    def __init__(self):
+        self.min_batch_size = 1
+        self.max_batch_size = 20
+        self.current_batch_size = 5  # Start conservative
+        self.success_count = 0
+        self.error_count = 0
         
-    async def add_item(self, item: Dict):
-        await self.queue.put(item)
-        
-    async def process_batch(self, processor_func: Callable) -> List[Dict]:
-        """Process items in batches"""
-        batch = []
-        results = []
-        
-        while not self.queue.empty():
-            try:
-                item = self.queue.get_nowait()
-                batch.append(item)
-                
-                if len(batch) >= self.batch_size:
-                    async with self.semaphore:
-                        batch_results = await processor_func(batch)
-                        results.extend(batch_results)
-                        batch = []
-            except asyncio.QueueEmpty:
-                break
-        
-        if batch:
-            async with self.semaphore:
-                batch_results = await processor_func(batch)
-                results.extend(batch_results)
-        
-        return results
+    async def adjust_batch_size(self, success: bool):
+        """Dynamically adjust batch size based on success/failure"""
+        if success:
+            self.success_count += 1
+            self.error_count = max(0, self.error_count - 1)
+            if self.success_count >= 3:
+                self.current_batch_size = min(
+                    self.max_batch_size,
+                    self.current_batch_size + 2
+                )
+                self.success_count = 0
+        else:
+            self.error_count += 1
+            self.success_count = 0
+            if self.error_count >= 2:
+                self.current_batch_size = max(
+                    self.min_batch_size,
+                    self.current_batch_size - 2
+                )
+                self.error_count = 0
 
 class SliteAPI:
     """
@@ -141,28 +139,51 @@ class SliteAPI:
     
     def __init__(self, api_key: str):
         """Initialize the Slite API client"""
-        self.api_key = api_key
-        self.base_url = "https://api.slite.com"  # Base URL for Slite API
+        self.api_key = api_key.strip().replace('"', '').replace("'", '')
+        self.base_url = "https://api.slite.com/v1"
+        self._headers = {  # Changed from self.headers to self._headers to match usage
+            "x-slite-api-key": self.api_key,
+            "Content-Type": "application/json",
+            "Accept": "application/json"
+        }
         self.session = None
         self.events = SliteEventHandler()
         self._workspace_id = None
         self._session_active = False
         self._force_cleanup = False
+        self.batch_processor = BatchProcessor()
+        self._concurrent_requests = 0
+        self._max_concurrent = 3  # Start conservative
 
+    async def _acquire_request_slot(self):
+        """Wait for available request slot"""
+        while self._concurrent_requests >= self._max_concurrent:
+            await asyncio.sleep(0.1)
+        self._concurrent_requests += 1
+
+    async def _release_request_slot(self):
+        """Release request slot"""
+        self._concurrent_requests = max(0, self._concurrent_requests - 1)
+
+    async def _release_session(self):
+        """Release but don't close the session"""
+        if self._session_active:
+            # Just mark the session as not in use
+            self._session_in_use = False
+            logger.debug("Session marked as released")
+    
     async def ensure_session(self):
         """Ensure a valid session exists, creating one if needed"""
         if not self._session_active or not self.session or self.session.closed:
             timeout = aiohttp.ClientTimeout(total=30)
             self.session = aiohttp.ClientSession(
-                headers={
-                    "x-slite-api-key": self.api_key,  # Changed from "Authorization"
-                    "Content-Type": "application/json",
-                    "Accept": "application/json"
-                },
+                headers=self._headers,  # Now this will work correctly
                 timeout=timeout
             )
             self._session_active = True
-            logger.info("Created new API session")
+            self._session_in_use = True
+            logger.info("Created new API session with headers")
+            logger.debug(f"Using API key: {self.api_key[:10]}...")  # Log first 10 chars of API key
 
     async def __aenter__(self):
         """Async context manager entry"""
@@ -174,53 +195,44 @@ class SliteAPI:
         if self._force_cleanup:
             await self.close(force=True)
 
-    @backoff.on_exception(backoff.expo, 
-                          (aiohttp.ClientError, Exception),
-                          max_tries=3,
-                          max_time=10)
+    @backoff.on_exception(
+        backoff.expo,
+        (aiohttp.ClientError, Exception),
+        max_tries=3,
+        max_time=30  # Reduced from original
+    )
     async def _make_request(self, method: str, endpoint: str, **kwargs) -> Dict:
-        """Make an HTTP request to the Slite API with retry logic and auto-reconnection"""
-        await self.ensure_session()
-        
-        for attempt in range(3):  # Try up to 3 times
-            try:
-                url = f"{self.base_url}{endpoint}"
-                async with self.session.request(method, url, **kwargs) as response:
-                    if response.status == 404:
-                        logger.error(f"Resource not found: {endpoint}")
-                        raise Exception(f"Resource not found: {endpoint}")
-                    elif response.status == 429:
-                        logger.error("Rate limit exceeded")
-                        raise Exception("Rate limit exceeded")
-                    elif response.status == 503:
-                        logger.error("Service temporarily unavailable. Retrying...")
-                        raise Exception("Service temporarily unavailable")
-                    elif response.status >= 400:
-                        error_text = await response.text()
-                        logger.error(f"Request failed: Error {response.status}: {error_text}")
-                        raise Exception(f"Request failed: {error_text}")
-                    
-                    # For DELETE requests that return 204, return empty dict
-                    if method == "DELETE" and response.status == 204:
-                        return {}
-                        
-                    # For all other requests, try to parse JSON
-                    try:
-                        response_json = await response.json()
-                        return response_json
-                    except aiohttp.ContentTypeError:
-                        # If no JSON and not a DELETE 204, that's an error
-                        if not (method == "DELETE" and response.status == 204):
-                            raise
-                        return {}
-                    
-            except aiohttp.ClientError as e:
-                if "Session is closed" in str(e):
-                    logger.warning("Session closed, recreating...")
-                    await self.ensure_session()
-                    continue
-                raise
-        raise Exception("Failed after 3 attempts")
+        """Make API request with proper error handling per docs"""
+        await self._acquire_request_slot()
+        try:
+            # Add headers if not provided in kwargs
+            if 'headers' not in kwargs:
+                kwargs['headers'] = self._headers  # Use _headers here too
+                
+            async with self.session.request(
+                method, 
+                f"{self.base_url}{endpoint}", 
+                **kwargs
+            ) as response:
+                if response.status == 204:  # No content
+                    return {}
+                elif response.status == 401:
+                    raise AuthenticationError("Invalid API key")
+                elif response.status == 402:
+                    raise Exception("Feature disabled for your organization")
+                elif response.status == 404:
+                    raise Exception("Resource not found")
+                elif response.status == 422:
+                    raise Exception("Input validation error")
+                elif response.status == 429:
+                    raise Exception("Rate limit exceeded")
+                elif response.status >= 400:
+                    text = await response.text()
+                    raise Exception(f"API error: {text}")
+                
+                return await response.json()
+        finally:
+            await self._release_request_slot()
 
     async def close(self, force: bool = False):
         """Explicitly close the session"""
@@ -233,7 +245,7 @@ class SliteAPI:
         """List all documents in Slite"""
         try:
             # Use search endpoint with empty query to get all documents
-            response = await self._make_request("GET", "/v1/search-notes", params={"type": "note"})
+            response = await self._make_request("GET", "/search-notes", params={"type": "note"})
             documents = []
             if isinstance(response, dict):
                 documents = response.get('hits', [])
@@ -251,7 +263,7 @@ class SliteAPI:
         """List all available folders"""
         try:
             # Get all folders using search
-            response = await self._make_request("GET", "/v1/search-notes", params={"type": "folder"})
+            response = await self._make_request("GET", "/search-notes", params={"type": "folder"})
             
             # Extract folders from the response
             folders = []
@@ -276,7 +288,7 @@ class SliteAPI:
                 "description": description,
                 "type": "folder"
             }
-            response = await self._make_request("POST", "/v1/notes", json=data)
+            response = await self._make_request("POST", "/notes", json=data)
             self.events.trigger_folder_created(response)
             logger.info(f"Successfully created folder: {name}")
             return response
@@ -287,7 +299,7 @@ class SliteAPI:
     async def delete_folder(self, folder_id: str) -> Dict:
         """Delete a folder"""
         try:
-            response = await self._make_request("DELETE", f"/v1/notes/{folder_id}")
+            response = await self._make_request("DELETE", f"/notes/{folder_id}")
             logger.info(f"Successfully deleted folder {folder_id}")
             return response
             
@@ -302,7 +314,7 @@ class SliteAPI:
             data = {
                 "title": new_name
             }
-            response = await self._make_request("PUT", f"/v1/notes/{folder_id}", json=data)
+            response = await self._make_request("PUT", f"/notes/{folder_id}", json=data)
             self.events.trigger_folder_updated(response)
             logger.info(f"Successfully renamed folder to: {new_name}")
             return response
@@ -325,7 +337,7 @@ class SliteAPI:
             if parent_note_id:
                 logger.info(f"Document will be created under parent {parent_note_id}")
             
-            response = await self._make_request("POST", "/v1/notes", json=data)
+            response = await self._make_request("POST", "/notes", json=data)
             
             if not response:
                 raise Exception("No response received from create request")
@@ -344,7 +356,7 @@ class SliteAPI:
     async def get_document(self, doc_id: str) -> Dict:
         """Get a document by ID"""
         try:
-            response = await self._make_request("GET", f"/v1/notes/{doc_id}")
+            response = await self._make_request("GET", f"/notes/{doc_id}")
             
             content = response.get('content', '')
             if isinstance(content, dict):
@@ -373,7 +385,7 @@ class SliteAPI:
             if title:
                 data["title"] = title
             
-            response = await self._make_request("PUT", f"/v1/notes/{doc_id}", json=data)
+            response = await self._make_request("PUT", f"/notes/{doc_id}", json=data)
             
             if not response:
                 raise Exception("No response received from update request")
@@ -392,7 +404,7 @@ class SliteAPI:
             
             # First verify the note exists
             try:
-                note = await self._make_request("GET", f"/v1/notes/{doc_id}")
+                note = await self._make_request("GET", f"/notes/{doc_id}")
                 if not note:
                     return {"status": "error", "message": f"Document {doc_id} not found"}
             except Exception as e:
@@ -401,7 +413,7 @@ class SliteAPI:
                 raise
 
             # Delete the note
-            response = await self._make_request("DELETE", f"/v1/notes/{doc_id}")
+            response = await self._make_request("DELETE", f"/notes/{doc_id}")
             
             # For successful deletion (204 No Content)
             if response is None or not response:
@@ -431,7 +443,7 @@ class SliteAPI:
                 "markdown": current_doc.get('markdown', '')  # Preserve existing content
             }
             
-            response = await self._make_request("PUT", f"/v1/notes/{doc_id}", json=data)
+            response = await self._make_request("PUT", f"/notes/{doc_id}", json=data)
             self.events.trigger_document_updated(response)
             logger.info(f"Successfully renamed document to: {new_title}")
             return response
@@ -505,49 +517,41 @@ class SliteAPI:
             raise
 
     async def search_notes_async(self, query: str) -> List[Dict]:
-        """Search for notes asynchronously"""
+        """Search notes - Updated per API docs"""
         try:
-            logger.info(f"Searching notes with query: {query}")
-            response = await self._make_request(
-                "GET", 
-                "/v1/search-notes",
-                params={
-                    "query": query,
-                    "type": "note",  # Only search for notes
-                    "hitsPerPage": 10  # Increase hits to find exact match
-                }
-            )
-            
-            # Extract hits from response
-            if isinstance(response, dict):
-                hits = response.get('hits', [])
-            else:
-                hits = response if isinstance(response, list) else []
-            
-            logger.info(f"Found {len(hits)} matching notes")
-            return hits
-            
+            params = {
+                "query": query,
+                "hitsPerPage": 20,
+                "page": 0,
+                "highlightPreTag": "<mark>",  # Optional highlighting
+                "highlightPostTag": "</mark>"
+            }
+            response = await self._make_request("GET", "/search-notes", params=params)
+            return response.get('hits', [])
         except Exception as e:
             logger.error(f"Error searching notes: {str(e)}")
             raise
 
     async def create_note_async(self, title: str, content: str, parent_note_id: str = None) -> Dict:
-        """Create a note asynchronously"""
-        data = {
-            "title": title,
-            "markdown": content
-        }
-        if parent_note_id:
-            data["parentNoteId"] = parent_note_id
-            
-        logger.info(f"Creating note '{title}' with content length {len(content)}")
-        response = await self._make_request("POST", "/v1/notes", json=data)
-        self.events.trigger_document_created(response)
-        return response
+        """Create a note asynchronously - Updated per API docs"""
+        try:
+            data = {
+                "title": title,
+                "parentNoteId": parent_note_id if parent_note_id else None,
+                "templateId": None,  # Optional per docs
+                "markdown": content,
+                "attributes": []  # Required per docs
+            }
+
+            logger.info(f"Creating note '{title}' with content length {len(content)}")
+            return await self._make_request("POST", "/notes", json=data)
+        except Exception as e:
+            logger.error(f"Error creating note: {str(e)}")
+            raise
 
     async def get_note_async(self, note_id: str) -> Dict:
         """Get a note by ID asynchronously"""
-        response = await self._make_request("GET", f"/v1/notes/{note_id}")
+        response = await self._make_request("GET", f"/notes/{note_id}")
         # Extract markdown content from response
         if isinstance(response.get('content'), dict):
             response['markdown'] = response['content'].get('markdown', '')
@@ -568,23 +572,28 @@ class SliteAPI:
         try:
             logger.info(f"Updating note {note_id}")
 
-            # Format request payload according to API docs
+            # Get existing note if appending
+            if append:
+                existing_note = await self.get_note_async(note_id)
+                if existing_note and existing_note.get('markdown'):
+                    content = f"{existing_note['markdown']}\n\n{content}"
+
+            # Format according to API docs
             update_payload = {
-                "markdown": content
+                "markdown": content,
+                "attributes": []  # Required by API
             }
 
-            # Make the update request
+            logger.info(f"Updating note {note_id}")
             response = await self._make_request(
                 "PUT",
-                f"/v1/notes/{note_id}",
+                f"/notes/{note_id}",
                 json=update_payload
             )
 
             if response:
-                logger.info(f"Successfully updated note {note_id}")
                 return {"status": "success", "data": response}
-            else:
-                raise Exception(f"Failed to update note {note_id}")
+            raise Exception("No response received from update request")
 
         except Exception as e:
             logger.error(f"Error updating note: {str(e)}")
@@ -597,7 +606,7 @@ class SliteAPI:
             
             # First verify the note exists
             try:
-                note = await self._make_request("GET", f"/v1/notes/{note_id}")
+                note = await self._make_request("GET", f"/notes/{note_id}")
                 if not note:
                     return {"status": "error", "message": f"Note {note_id} not found"}
             except Exception as e:
@@ -606,7 +615,7 @@ class SliteAPI:
                 raise
 
             # Delete the note
-            response = await self._make_request("DELETE", f"/v1/notes/{note_id}")
+            response = await self._make_request("DELETE", f"/notes/{note_id}")
             
             # For successful deletion (204 No Content)
             if response is None or not response:
@@ -627,7 +636,7 @@ class SliteAPI:
             logger.info(f"Searching for folder: {folder_name}")
             response = await self._make_request(
                 "GET", 
-                "/v1/search-notes",
+                "/search-notes",
                 params={
                     "query": folder_name,
                     "type": "folder",  # Specify folder type in search
@@ -650,6 +659,47 @@ class SliteAPI:
         except Exception as e:
             logger.error(f"Error searching for folder: {str(e)}")
             raise
+
+    async def ask_question(self, question: str, parent_note_id: Optional[str] = None) -> Dict:
+        """Ask a question using Slite's ask endpoint"""
+        params = {"question": question}
+        if parent_note_id:
+            params["parentNoteId"] = parent_note_id
+        return await self._make_request("GET", "/ask", params=params)
+
+    async def index_custom_content(self, data: Dict) -> Dict:
+        """Index custom content for AskX usage"""
+        return await self._make_request("POST", "/ask/index", json=data)
+
+    async def delete_custom_content(self, root_id: str, content_id: str) -> Dict:
+        """Delete custom content from AskX"""
+        data = {
+            "rootId": root_id,
+            "id": content_id
+        }
+        return await self._make_request("DELETE", "/ask/index", json=data)
+
+    async def list_custom_content(self, root_id: str, page: int = 0, hits_per_page: int = 20) -> Dict:
+        """List custom content ids"""
+        params = {
+            "rootId": root_id,
+            "page": page,
+            "hitsPerPage": min(hits_per_page, 100)
+        }
+        return await self._make_request("GET", "/ask/index", params=params)
+
+    async def update_tile(self, note_id: str, tile_id: str, data: Dict) -> Dict:
+        """Update a tile in a note"""
+        return await self._make_request(
+            "PUT", 
+            f"/notes/{note_id}/tiles/{tile_id}",
+            json=data
+        )
+
+    async def get_note_children(self, note_id: str, cursor: Optional[str] = None) -> Dict:
+        """Get children of a note"""
+        params = {"cursor": cursor} if cursor else {}
+        return await self._make_request("GET", f"/notes/{note_id}/children", params=params)
 
 if __name__ == "__main__":
     # Test the API connection

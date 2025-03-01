@@ -2,6 +2,8 @@ import os
 from typing import Optional, Union, List, Dict, Any
 from pathlib import Path
 from dotenv import load_dotenv
+import google.api_core
+from google.api_core import retry
 import google.generativeai as genai
 from langchain.text_splitter import CharacterTextSplitter
 from langchain.chains import RetrievalQA
@@ -115,11 +117,24 @@ class DocumentContext:
 
 class SliteQAAgent:
     def __init__(self, gemini_api_key: str, slite_api_key: str, channel_id: str = None):
+        # Configure Gemini - Simplified configuration
         genai.configure(api_key=gemini_api_key)
+        
+        # Create LLM with retry logic
         self.llm = ChatGoogleGenerativeAI(
-            model="gemini-pro",
+            model="models/gemini-1.5-pro",
             google_api_key=gemini_api_key,
-            temperature=0
+            temperature=0,
+            convert_system_message_to_human=False,
+            retry=retry.Retry(
+                initial=1.0,
+                maximum=60.0,
+                multiplier=2,
+                predicate=retry.if_exception_type(
+                    google.api_core.exceptions.ResourceExhausted,
+                    google.api_core.exceptions.ServiceUnavailable,
+                )
+            )
         )
         self.slite_client = SliteAPI(slite_api_key, default_channel_id=channel_id)
         self.doc_context = DocumentContext()

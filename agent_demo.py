@@ -28,11 +28,16 @@ class AgentDemo:
         logger.info("Initializing AgentDemo...")
         load_dotenv()
         
-        # Update required vars to check for OpenAI key
-        required_vars = ["SLITE_API_KEY", "OPENAI_API_KEY"]  # Changed from GEMINI_API_KEY
-        missing_vars = [var for var in required_vars if not os.getenv(var)]
-        if missing_vars:
-            raise ValueError(f"Missing required environment variables: {', '.join(missing_vars)}")
+        # Validate API keys with proper format checking
+        self.slite_api_key = os.getenv("SLITE_API_KEY", "").strip()
+        self.gemini_api_key = os.getenv("GEMINI_API_KEY", "").strip()  # Changed to Gemini
+        
+        # Update validation for API keys
+        if not self.slite_api_key or not self.slite_api_key.startswith("5L173-"):
+            raise ValueError("Invalid SLITE_API_KEY format. Key should start with '5L173-'")
+            
+        if not self.gemini_api_key:  # Simple check for Gemini key
+            raise ValueError("GEMINI_API_KEY is missing or empty")
         
         self.agent = None
         self.qa_agent = None
@@ -43,21 +48,25 @@ class AgentDemo:
         """Initialize the Slite agent and QA agent"""
         if not self.agent:
             try:
-                slite_api_key = os.getenv("SLITE_API_KEY")
-                openai_api_key = os.getenv("OPENAI_API_KEY")  # Changed from gemini_api_key
-                
-                self.agent = SliteAgent(api_key=slite_api_key, openai_api_key=openai_api_key)  # Updated parameter name
+                # Initialize agent with Gemini
+                self.agent = SliteAgent(
+                    api_key=self.slite_api_key, 
+                    gemini_api_key=self.gemini_api_key  # Changed to use Gemini
+                )
                 await self.agent._ensure_session()
                 await self.agent.initialize_agent()
                 
             except Exception as e:
                 logger.error(f"Error initializing agent: {str(e)}")
+                if hasattr(self.agent, 'api') and hasattr(self.agent.api, 'session'):
+                    await self.agent.api.close(force=True)
                 raise ValueError(f"Failed to initialize agent: {str(e)}")
 
     async def cleanup(self):
-        """Cleanup resources"""
-        # No cleanup needed with new implementation
-        pass
+        """Cleanup resources properly"""
+        if self.agent and hasattr(self.agent, 'api'):
+            await self.agent.api.close(force=True)
+            self._session_active = False
 
     async def run_query(self, query: str, description: Optional[str] = None):
         """Run a query and display the results with optional description"""
@@ -86,6 +95,10 @@ class AgentDemo:
             logger.error(traceback.format_exc())
             print(f"\nError: {error_msg}")
             return None
+        finally:
+            # Release the session after each query
+            if self.agent and hasattr(self.agent, 'api'):
+                await self.agent.api._release_session()
 
     async def run_demo_sequence(self):
         """Run a sequence of demo operations showcasing different features"""

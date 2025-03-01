@@ -1,10 +1,15 @@
 import os
 import logging
 import asyncio
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional
 from functools import partial
 from langchain_openai import ChatOpenAI
+from langchain_google_genai import ChatGoogleGenerativeAI  # Add this import
+import google.generativeai as genai  # Add this import
+from google.api_core import exceptions as google_exceptions  # Add this import
+from google.api_core import exceptions, retry
+import google.api_core
 from langchain.agents import AgentType, initialize_agent, Tool
 from langchain.memory import ConversationSummaryBufferMemory
 from langchain.prompts import MessagesPlaceholder
@@ -16,6 +21,9 @@ from note_manager import NoteManager, SliteAPI
 from models import MeetingNote, FolderStructure
 import json
 import traceback
+from google.api_core import retry
+import tenacity
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +35,7 @@ class SliteTools:
         self._last_note_id = None  # Store the ID of the last created/accessed note
         self._last_folder_id = None  # Store the ID of the last created/accessed folder
         self._existing_notes_cache = {}  # Add cache initialization
+        self._folder_cache = {}  # Add folder cache
 
     @property
     def last_note_id(self):
@@ -329,16 +338,78 @@ class SliteTools:
                 "message": f"Error deleting note: {error_msg}"
             }, indent=2)
 
-    async def create_folder(self, name: str, description: str = "") -> str:
-        """Create a new folder"""
+    async def _find_existing_folder(self, folder_name: str) -> Optional[Dict[str, Any]]:
+        """Find existing folder by name with caching"""
         try:
-            result = await self.api.create_folder(name=name, description=description)
-            if result and isinstance(result, dict):
+            # Check cache first
+            folder_name_lower = folder_name.lower()
+            if folder_name_lower in self._folder_cache:
+                logger.info(f"Found folder in cache: {folder_name}")
+                return self._folder_cache[folder_name_lower]
+
+            # Search using proper Slite API parameters per docs
+            logger.info(f"Searching for folder: {folder_name}")
+            response = await self.api._make_request(
+                "GET",
+                "/search-notes",
+                params={
+                    "query": folder_name,
+                    "type": "folder",
+                    "hitsPerPage": 10
+                }
+            )
+            
+            hits = response.get('hits', [])
+            for hit in hits:
+                if hit.get('title', '').lower() == folder_name_lower:
+                    # Cache the found folder
+                    self._folder_cache[folder_name_lower] = hit
+                    logger.info(f"Found folder: {folder_name}")
+                    return hit
+                    
+            logger.info(f"No folder found with name: {folder_name}")
+            return None
+
+        except Exception as e:
+            logger.error(f"Error finding folder: {str(e)}")
+            return None
+
+    async def create_folder(self, name: str, description: str = "") -> str:
+        """Create a new folder if it doesn't exist"""
+        try:
+            # First check if folder exists
+            existing_folder = await self._find_existing_folder(name)
+            if existing_folder:
+                self._last_folder_id = existing_folder.get('id')
+                logger.info(f"Using existing folder: {name}")
+                return json.dumps({
+                    "status": "success",
+                    "message": "Using existing folder",
+                    "folder": existing_folder
+                }, indent=2)
+
+            # Create new folder only if it doesn't exist
+            data = {
+                "title": name,
+                "description": description,
+                "type": "folder"
+            }
+            result = await self.api._make_request("POST", "/notes", json=data)
+            
+            if result:
                 self._last_folder_id = result.get('id')
+                # Cache the new folder
+                self._folder_cache[name.lower()] = result
+                logger.info(f"Created new folder: {name}")
+                
             return json.dumps({"status": "success", "folder": result}, indent=2)
+            
         except Exception as e:
             logger.error(f"Error creating folder: {str(e)}")
-            return f"Error creating folder: {str(e)}"
+            return json.dumps({
+                "status": "error",
+                "message": f"Error creating folder: {str(e)}"
+            }, indent=2)
 
     async def create_note_in_folder(self, title: str, content: str, folder_name: str = None, tags: Optional[List[str]] = None) -> str:
         """Create a new note in a specific folder"""
@@ -346,48 +417,41 @@ class SliteTools:
             folder_id = None
             
             if folder_name:
-                # First try to find the folder in cache
-                for fid, data in self._existing_notes_cache.items():
-                    if data.get('type') == 'folder' and data.get('title', '').lower() == folder_name.lower():
-                        folder_id = fid
-                        logger.info(f"Found folder in cache: {folder_name} with ID: {folder_id}")
-                        break
+                # First check if folder exists
+                existing_folder = await self._find_existing_folder(folder_name)
+                if existing_folder:
+                    folder_id = existing_folder.get('id')
+                    logger.info(f"Using existing folder: {folder_name}")
+                else:
+                    # Create new folder if needed
+                    logger.info(f"Creating new folder: {folder_name}")
+                    folder_result = await self.api.create_folder(name=folder_name)
+                    folder_id = folder_result.get('id')
+                    self._folder_cache[folder_name.lower()] = folder_result
 
-                # If not in cache, search for existing folder
-                if not folder_id:
-                    folder = await self.api.search_folder_by_name(folder_name)
-                    if folder:
-                        folder_id = folder.get('id')
-                        # Add to cache
-                        self._existing_notes_cache[folder_id] = {
-                            'title': folder_name,
-                            'type': 'folder'
-                        }
-                        logger.info(f"Found existing folder: {folder_name} with ID: {folder_id}")
-                    else:
-                        # Create new folder if not found
-                        logger.info(f"Creating new folder: {folder_name}")
-                        folder_result = await self.api.create_folder(name=folder_name)
-                        folder_id = folder_result.get('id')
-                        # Cache the new folder
-                        self._last_folder_id = folder_id
-                        self._existing_notes_cache[folder_id] = {
-                            'title': folder_name,
-                            'type': 'folder'
-                        }
+            # Ensure we have minimum content per API requirements
+            if not content:
+                content = "# New document"
+
+            # Create note in folder using proper API format
+            data = {
+                "title": title,
+                "markdown": content,
+                "parentNoteId": folder_id,
+                "attributes": []  # Required per API docs
+            }
             
-            # Create note in the folder
-            logger.info(f"Creating note '{title}' in folder '{folder_name}' (ID: {folder_id})")
-            result = await self.api.create_note_async(
-                title=title, 
-                content=content, 
-                parent_note_id=folder_id
-            )
+            logger.info(f"Creating note '{title}' in folder '{folder_name}'")
+            result = await self.api._make_request("POST", "/notes", json=data)
             
-            if result and isinstance(result, dict):
+            if result:
                 self._last_note_id = result.get('id')
-                return json.dumps({"status": "success", "note": result}, indent=2)
-                
+                return json.dumps({
+                    "status": "success",
+                    "message": f"Created note '{title}' in folder '{folder_name}'",
+                    "note": result
+                }, indent=2)
+            
             return json.dumps({"status": "error", "message": "Failed to create note"}, indent=2)
             
         except Exception as e:
@@ -474,34 +538,99 @@ class RenameNoteInput(BaseModel):
     note_title: str = Field(..., description="The current title of the note")
     new_title: str = Field(..., description="The new title for the note")
 
+class ResourceManager:
+    """Manage API resources dynamically"""
+    def __init__(self):
+        self.max_concurrent = 3  # Start with conservative limits
+        self.batch_size = 5
+        self._request_count = 0
+        self._error_count = 0
+        self._last_adjustment = datetime.now()
+        self._adjustment_interval = timedelta(minutes=1)
+
+    async def adjust_limits(self, success: bool):
+        """Dynamically adjust resource limits based on success/failure"""
+        now = datetime.now()
+        if now - self._last_adjustment < self._adjustment_interval:
+            return
+
+        if success:
+            # Gradually increase limits on successful operations
+            self._error_count = max(0, self._error_count - 1)
+            if self._error_count == 0:
+                self.max_concurrent = min(10, self.max_concurrent + 1)
+                self.batch_size = min(20, self.batch_size + 2)
+        else:
+            # Quickly reduce limits on errors
+            self._error_count += 1
+            if self._error_count > 2:
+                self.max_concurrent = max(1, self.max_concurrent - 1)
+                self.batch_size = max(1, self.batch_size - 2)
+
+        self._last_adjustment = now
+
 class SliteAgent:
     """LangChain agent for interacting with Slite with enhanced features"""
 
-    def __init__(self, api_key: str, openai_api_key: str = None):
+    async def clear_memory(self):
+        """Clear conversation memory to free up resources"""
+        if hasattr(self, 'memory'):
+            self.memory.clear()
+            logger.info("Cleared conversation memory")
+
+    def __init__(self, api_key: str, gemini_api_key: str = None):
         """Initialize the SliteAgent with API keys and tools"""
         self.api_key = api_key
-        self.openai_api_key = openai_api_key or os.getenv("OPENAI_API_KEY")
-        if not self.openai_api_key:
-            raise ValueError("OpenAI API key must be provided")
+        self.gemini_api_key = gemini_api_key or os.getenv("GEMINI_API_KEY")
+        if not self.gemini_api_key:
+            raise ValueError("Gemini API key must be provided")
         
-        self.api = SliteAPI(self.api_key)
-        self.tools = None
+        # Configure Gemini without restrictive limits
+        llm = ChatGoogleGenerativeAI(
+            model="models/gemini-1.5-pro",
+            google_api_key=self.gemini_api_key,
+            temperature=0,
+            convert_system_message_to_human=False
+        )
+        
+        # Initialize memory without token limits
         self.memory = ConversationSummaryBufferMemory(
-            llm=ChatOpenAI(
-                model="gpt-3.5-turbo",
-                temperature=0,
-                api_key=self.openai_api_key
-            ),
-            max_token_limit=500,
+            llm=llm,
             memory_key="chat_history",
             return_messages=True
         )
+
+        # Keep periodic cleanup
+        self._last_memory_cleanup = datetime.now()
+        self._memory_cleanup_interval = timedelta(minutes=5)
         
+        # Initialize other attributes
+        self.api = SliteAPI(self.api_key)
+        self.tools = None
         self.agent_executor = None
         self._session_initialized = False
         self._session_in_use = False
         self._keep_session_alive = True
         self._force_cleanup = False
+        self.resource_manager = ResourceManager()
+
+        # Add rate limiting parameters
+        self._request_count = 0
+        self._last_request_time = datetime.now()
+        self._request_window = timedelta(minutes=1)
+        self._max_requests_per_minute = 50
+        self._retry_delay = 2
+
+        # Update retry configuration
+        self._retry_config = retry.Retry(
+            initial=1.0,
+            maximum=30.0,
+            multiplier=1.5,
+            predicate=retry.if_exception_type(
+                google.api_core.exceptions.ResourceExhausted,
+                google.api_core.exceptions.ServiceUnavailable,
+            )
+        )
 
     async def _ensure_session(self):
         """Ensure API session is initialized"""
@@ -658,10 +787,11 @@ class SliteAgent:
 
                 self.agent_executor = initialize_agent(
                     tools=tools,
-                    llm=ChatOpenAI(
-                        model="gpt-3.5-turbo",
+                    llm=ChatGoogleGenerativeAI(
+                        model="models/gemini-1.5-pro",  # Updated model name
+                        google_api_key=self.gemini_api_key,
                         temperature=0,
-                        api_key=self.openai_api_key
+                        convert_system_message_to_human=False
                     ),
                     agent=AgentType.STRUCTURED_CHAT_ZERO_SHOT_REACT_DESCRIPTION,
                     verbose=True,
@@ -675,9 +805,49 @@ class SliteAgent:
             logger.error(f"Error initializing agent: {str(e)}")
             raise
     
-    async def process_query(self, query: str) -> str:
-        """Process a user query and return the response"""
+    async def _check_rate_limit(self):
+        """Dynamic rate limiting"""
         try:
+            current_time = datetime.now()
+            
+            # Calculate dynamic window based on current load
+            window_size = max(1, min(5, self.resource_manager.max_concurrent))
+            max_requests = self.resource_manager.batch_size * window_size
+            
+            if self._request_count >= max_requests:
+                delay = 1 + (self._request_count - max_requests) * 0.5
+                logger.info(f"Rate limit reached. Adjusting delay: {delay}s")
+                await asyncio.sleep(delay)
+                self._request_count = 0
+                await self.resource_manager.adjust_limits(False)
+            else:
+                await self.resource_manager.adjust_limits(True)
+                
+            self._request_count += 1
+            
+        except Exception as e:
+            logger.error(f"Error in rate limiting: {str(e)}")
+            await self.resource_manager.adjust_limits(False)
+
+    @tenacity.retry(
+        retry=tenacity.retry_if_exception_type(
+            (google.api_core.exceptions.ResourceExhausted,
+             google.api_core.exceptions.ServiceUnavailable)
+        ),
+        wait=tenacity.wait_exponential(multiplier=1, min=2, max=30),
+        stop=tenacity.stop_after_attempt(3)
+    )
+    async def process_query(self, query: str) -> str:
+        """Process a user query with dynamic resource management"""
+        try:
+            # Check if memory cleanup is needed
+            now = datetime.now()
+            if now - self._last_memory_cleanup > self._memory_cleanup_interval:
+                await self.clear_memory()
+                self._last_memory_cleanup = now
+
+            # Process query with resource management
+            await self._check_rate_limit()
             await self._ensure_session()
             
             if not self.agent_executor:
