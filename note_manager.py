@@ -12,7 +12,7 @@ import asyncio
 import re
 from functools import lru_cache
 from slite_api import SliteAPI
-from models import MeetingNote, FolderStructure
+from models import MeetingNote, FolderStructure, NoteCreate, NoteUpdate, CustomContent
 
 logger = logging.getLogger(__name__)
 
@@ -168,3 +168,33 @@ class NoteManager:
         except Exception as e:
             logger.error(f"Error deleting note: {str(e)}")
             raise
+
+    async def create_note_with_template(self, title: str, template_id: str) -> Dict:
+        """Create a note using a template"""
+        data = NoteCreate(
+            title=title,
+            templateId=template_id
+        )
+        return await self.api.create_note_async(data.dict())
+
+    async def update_note_content(self, note_id: str, markdown: str, html: str = None) -> Dict:
+        """Update note content with markdown or HTML"""
+        data = NoteUpdate(
+            markdown=markdown,
+            html=html
+        )
+        return await self.api.update_note_async(note_id, data.dict())
+
+    async def index_documentation(self, docs: List[Dict]) -> None:
+        """Index documentation for search"""
+        for doc in docs:
+            content = CustomContent(
+                rootId=doc["rootId"],
+                id=doc["id"],
+                title=doc["title"],
+                content=doc["content"],
+                type="markdown",
+                updatedAt=doc["updatedAt"],
+                url=doc["url"]
+            )
+            await self.api.index_custom_content(content.dict())

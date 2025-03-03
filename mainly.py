@@ -1,13 +1,15 @@
 import os
 import logging
 import asyncio
-import time
-import random
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional
 from functools import partial
-from langchain_google_genai import ChatGoogleGenerativeAI
-import google.generativeai as genai
+from langchain_openai import ChatOpenAI
+from langchain_google_genai import ChatGoogleGenerativeAI  # Add this import
+import google.generativeai as genai  # Add this import
+from google.api_core import exceptions as google_exceptions  # Add this import
+from google.api_core import exceptions, retry
+import google.api_core
 from langchain.agents import AgentType, initialize_agent, Tool
 from langchain.memory import ConversationSummaryBufferMemory
 from langchain.prompts import MessagesPlaceholder
@@ -19,7 +21,9 @@ from note_manager import NoteManager, SliteAPI
 from models import MeetingNote, FolderStructure
 import json
 import traceback
-from langchain_community.chat_models import ChatOpenAI  # Updated import
+from google.api_core import retry
+import tenacity
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +35,6 @@ class SliteTools:
         self._last_note_id = None  # Store the ID of the last created/accessed note
         self._last_folder_id = None  # Store the ID of the last created/accessed folder
         self._existing_notes_cache = {}  # Add cache initialization
-        self._selected_document = None  # Add selected document tracking
         self._folder_cache = {}  # Add folder cache
 
     @property
@@ -55,66 +58,14 @@ class SliteTools:
         return content
 
     async def _find_existing_note(self, title: str) -> Optional[Dict[str, Any]]:
-        """Find existing note by title, searching recursively through folders"""
+        """Find existing note by title"""
         try:
-            # Clean up the title by removing quotes
-            clean_title = title.strip("'\"").strip()
-            logger.info(f"Searching for note with title: {clean_title}")
-
-            # First try global search with proper params per API docs
-            search_response = await self.api._make_request(
-                method="GET",
-                endpoint="/search-notes",
-                params={
-                    "query": clean_title,
-                    "hitsPerPage": 100,
-                    "highlightPreTag": "",
-                    "highlightPostTag": ""
-                }
-            )
-
-            # Check hits from global search
-            hits = search_response.get('hits', [])
-            for hit in hits:
-                if hit.get('title', '').lower() == clean_title.lower():
-                    logger.info(f"Found note globally: {hit.get('title')}")
-                    return hit
-
-            # If not found globally, search in each folder
-            folders_response = await self.api._make_request(
-                method="GET",
-                endpoint="/search-notes",
-                params={
-                    "query": "",
-                    "type": "folder",
-                    "hitsPerPage": 100
-                }
-            )
-
-            folders = folders_response.get('hits', [])
-            for folder in folders:
-                folder_id = folder.get('id')
-                if folder_id:
-                    # Search within each folder with proper parentNoteId
-                    folder_results = await self.api._make_request(
-                        method="GET",
-                        endpoint="/search-notes",
-                        params={
-                            "query": clean_title,
-                            "parentNoteId": folder_id,
-                            "hitsPerPage": 100
-                        }
-                    )
-
-                    folder_hits = folder_results.get('hits', [])
-                    for note in folder_hits:
-                        if note.get('title', '').lower() == clean_title.lower():
-                            logger.info(f"Found note in folder {folder.get('title')}: {note.get('title')}")
-                            return note
-
-            logger.info(f"Note '{clean_title}' not found in any location")
+            search_results = await self.api.search_notes_async(title)
+            if search_results:
+                for note in search_results:
+                    if note.get('title', '').lower() == title.lower():
+                        return note
             return None
-
         except Exception as e:
             logger.error(f"Error finding existing note: {str(e)}")
             return None
@@ -145,14 +96,13 @@ class SliteTools:
                 await self.api.__aenter__()
                 
             content = self._sanitize_content(content)
-            clean_title = title.strip("'\"").strip()
             
             # First try to find the exact note by title
-            existing_note = await self._find_existing_note(clean_title)
+            existing_note = await self._find_existing_note(title)
             
             if existing_note:
                 note_id = existing_note['id']
-                logger.info(f"Found existing note with title '{clean_title}' (ID: {note_id})")
+                logger.info(f"Found existing note with title '{title}' (ID: {note_id})")
 
                 # Get existing content if appending
                 if append:
@@ -160,15 +110,10 @@ class SliteTools:
                     if existing_content:
                         content = f"{existing_content.rstrip()}\n\n{content}"
 
-                # Update the note using proper API format
-                data = {
-                    "markdown": content,
-                    "attributes": []
-                }
-
+                # Update the note using the note ID
                 result = await self.api.update_note_async(
                     note_id=note_id,
-                    content=data["markdown"],
+                    content=content,
                     append=append
                 )
 
@@ -186,15 +131,10 @@ class SliteTools:
                         "action": "updated"
                     }, indent=2)
             else:
-                # Create new note with proper API format
-                data = {
-                    "title": clean_title,
-                    "markdown": content,
-                    "attributes": []
-                }
-                
+                # Create new note
+                logger.info(f"Note with title '{title}' not found, creating new note")
                 result = await self.api.create_note_async(
-                    title=clean_title,
+                    title=title,
                     content=content
                 )
                 
@@ -398,23 +338,49 @@ class SliteTools:
                 "message": f"Error deleting note: {error_msg}"
             }, indent=2)
 
+    async def _find_existing_folder(self, folder_name: str) -> Optional[Dict[str, Any]]:
+        """Find existing folder by name with caching"""
+        try:
+            # Check cache first
+            folder_name_lower = folder_name.lower()
+            if folder_name_lower in self._folder_cache:
+                logger.info(f"Found folder in cache: {folder_name}")
+                return self._folder_cache[folder_name_lower]
+
+            # Search using proper Slite API parameters per docs
+            logger.info(f"Searching for folder: {folder_name}")
+            response = await self.api._make_request(
+                "GET",
+                "/search-notes",
+                params={
+                    "query": folder_name,
+                    "type": "folder",
+                    "hitsPerPage": 10
+                }
+            )
+            
+            hits = response.get('hits', [])
+            for hit in hits:
+                if hit.get('title', '').lower() == folder_name_lower:
+                    # Cache the found folder
+                    self._folder_cache[folder_name_lower] = hit
+                    logger.info(f"Found folder: {folder_name}")
+                    return hit
+                    
+            logger.info(f"No folder found with name: {folder_name}")
+            return None
+
+        except Exception as e:
+            logger.error(f"Error finding folder: {str(e)}")
+            return None
+
     async def create_folder(self, name: str, description: str = "") -> str:
         """Create a new folder if it doesn't exist"""
         try:
-            # First check folder cache
-            folder_name_lower = name.lower()
-            if folder_name_lower in self._folder_cache:
-                logger.info(f"Using cached folder: {name}")
-                return json.dumps({
-                    "status": "success", 
-                    "message": "Using existing folder",
-                    "folder": self._folder_cache[folder_name_lower]
-                }, indent=2)
-                
-            # Check if folder exists via search
-            existing_folder = await self.api.search_folder_by_name(name)
+            # First check if folder exists
+            existing_folder = await self._find_existing_folder(name)
             if existing_folder:
-                self._folder_cache[folder_name_lower] = existing_folder
+                self._last_folder_id = existing_folder.get('id')
                 logger.info(f"Using existing folder: {name}")
                 return json.dumps({
                     "status": "success",
@@ -423,10 +389,19 @@ class SliteTools:
                 }, indent=2)
 
             # Create new folder only if it doesn't exist
-            result = await self.api.create_folder(name=name, description=description)
+            data = {
+                "title": name,
+                "description": description,
+                "type": "folder"
+            }
+            result = await self.api._make_request("POST", "/notes", json=data)
+            
             if result:
-                self._folder_cache[folder_name_lower] = result
+                self._last_folder_id = result.get('id')
+                # Cache the new folder
+                self._folder_cache[name.lower()] = result
                 logger.info(f"Created new folder: {name}")
+                
             return json.dumps({"status": "success", "folder": result}, indent=2)
             
         except Exception as e:
@@ -441,52 +416,44 @@ class SliteTools:
         try:
             folder_id = None
             
-            if (folder_name):
-                # Use cached folder if available
-                folder_name_lower = folder_name.lower()
-                if folder_name_lower in self._folder_cache:
-                    folder_id = self._folder_cache[folder_name_lower].get('id')
-                    logger.info(f"Using cached folder: {folder_name}")
+            if folder_name:
+                # First check if folder exists
+                existing_folder = await self._find_existing_folder(folder_name)
+                if existing_folder:
+                    folder_id = existing_folder.get('id')
+                    logger.info(f"Using existing folder: {folder_name}")
                 else:
-                    # Search for existing folder
-                    existing_folder = await self.api.search_folder_by_name(folder_name)
-                    if existing_folder:
-                        folder_id = existing_folder.get('id')
-                        self._folder_cache[folder_name_lower] = existing_folder
-                        logger.info(f"Found existing folder: {folder_name}")
-                    else:
-                        # Create new folder if needed
-                        logger.info(f"Creating new folder: {folder_name}")
-                        folder_result = await self.api.create_folder(name=folder_name)
-                        folder_id = folder_result.get('id')
-                        self._folder_cache[folder_name_lower] = folder_result
+                    # Create new folder if needed
+                    logger.info(f"Creating new folder: {folder_name}")
+                    folder_result = await self.api.create_folder(name=folder_name)
+                    folder_id = folder_result.get('id')
+                    self._folder_cache[folder_name.lower()] = folder_result
 
-            # Create the note with required fields per API docs
+            # Ensure we have minimum content per API requirements
+            if not content:
+                content = "# New document"
+
+            # Create note in folder using proper API format
             data = {
                 "title": title,
-                "markdown": f"""# {title}
-
-This document was created in the {folder_name} folder.
-
-## Content
-{content if content else 'Add your content here...'}""",
-                "attributes": [],  # Required by API
-                "parentNoteId": folder_id if folder_id else None
+                "markdown": content,
+                "parentNoteId": folder_id,
+                "attributes": []  # Required per API docs
             }
-
+            
             logger.info(f"Creating note '{title}' in folder '{folder_name}'")
-            result = await self.api._make_request(
-                method="POST",
-                endpoint="/notes",
-                json=data
-            )
-
+            result = await self.api._make_request("POST", "/notes", json=data)
+            
             if result:
                 self._last_note_id = result.get('id')
-                return json.dumps({"status": "success", "note": result}, indent=2)
-
+                return json.dumps({
+                    "status": "success",
+                    "message": f"Created note '{title}' in folder '{folder_name}'",
+                    "note": result
+                }, indent=2)
+            
             return json.dumps({"status": "error", "message": "Failed to create note"}, indent=2)
-
+            
         except Exception as e:
             error_msg = str(e)
             logger.error(f"Error creating note in folder: {error_msg}")
@@ -571,68 +538,99 @@ class RenameNoteInput(BaseModel):
     note_title: str = Field(..., description="The current title of the note")
     new_title: str = Field(..., description="The new title for the note")
 
+class ResourceManager:
+    """Manage API resources dynamically"""
+    def __init__(self):
+        self.max_concurrent = 3  # Start with conservative limits
+        self.batch_size = 5
+        self._request_count = 0
+        self._error_count = 0
+        self._last_adjustment = datetime.now()
+        self._adjustment_interval = timedelta(minutes=1)
+
+    async def adjust_limits(self, success: bool):
+        """Dynamically adjust resource limits based on success/failure"""
+        now = datetime.now()
+        if now - self._last_adjustment < self._adjustment_interval:
+            return
+
+        if success:
+            # Gradually increase limits on successful operations
+            self._error_count = max(0, self._error_count - 1)
+            if self._error_count == 0:
+                self.max_concurrent = min(10, self.max_concurrent + 1)
+                self.batch_size = min(20, self.batch_size + 2)
+        else:
+            # Quickly reduce limits on errors
+            self._error_count += 1
+            if self._error_count > 2:
+                self.max_concurrent = max(1, self.max_concurrent - 1)
+                self.batch_size = max(1, self.batch_size - 2)
+
+        self._last_adjustment = now
+
 class SliteAgent:
     """LangChain agent for interacting with Slite with enhanced features"""
 
-    def __init__(self, api_key: str, openai_api_key: str = None):
-        """Initialize the SliteAgent with API keys"""
+    async def clear_memory(self):
+        """Clear conversation memory to free up resources"""
+        if hasattr(self, 'memory'):
+            self.memory.clear()
+            logger.info("Cleared conversation memory")
+
+    def __init__(self, api_key: str, gemini_api_key: str = None):
+        """Initialize the SliteAgent with API keys and tools"""
         self.api_key = api_key
-        self.openai_api_key = openai_api_key or os.getenv("OPENAI_API_KEY")
-        if not self.openai_api_key:
-            raise ValueError("OpenAI API key must be provided")
+        self.gemini_api_key = gemini_api_key or os.getenv("GEMINI_API_KEY")
+        if not self.gemini_api_key:
+            raise ValueError("Gemini API key must be provided")
         
-        self.api = SliteAPI(self.api_key)
-        self.tools = None
-        
-        # Update memory to use OpenAI
-        llm = ChatOpenAI(
-            model_name="gpt-4",
+        # Configure Gemini without restrictive limits
+        llm = ChatGoogleGenerativeAI(
+            model="models/gemini-1.5-pro",
+            google_api_key=self.gemini_api_key,
             temperature=0,
-            openai_api_key=self.openai_api_key
+            convert_system_message_to_human=False
         )
         
+        # Initialize memory without token limits
         self.memory = ConversationSummaryBufferMemory(
             llm=llm,
-            max_token_limit=500,
             memory_key="chat_history",
             return_messages=True
         )
+
+        # Keep periodic cleanup
+        self._last_memory_cleanup = datetime.now()
+        self._memory_cleanup_interval = timedelta(minutes=5)
         
+        # Initialize other attributes
+        self.api = SliteAPI(self.api_key)
+        self.tools = None
         self.agent_executor = None
         self._session_initialized = False
         self._session_in_use = False
         self._keep_session_alive = True
         self._force_cleanup = False
+        self.resource_manager = ResourceManager()
 
-        # Initialize rate limiting params
+        # Add rate limiting parameters
         self._request_count = 0
-        self._last_request_time = 0
-        self._max_requests_per_minute = 20
-        
-        # Update LLM config
-        self.llm = ChatOpenAI(
-            model_name="gpt-4",
-            temperature=0,
-            openai_api_key=self.openai_api_key,
-            request_timeout=30
-        )
+        self._last_request_time = datetime.now()
+        self._request_window = timedelta(minutes=1)
+        self._max_requests_per_minute = 50
+        self._retry_delay = 2
 
-    async def _check_rate_limit(self):
-        """Enforce rate limiting"""
-        current_time = time.time()
-        if current_time - self._last_request_time < 60:  # Within a minute
-            if self._request_count >= self._max_requests_per_minute:
-                wait_time = 60 - (current_time - self._last_request_time)
-                logger.warning(f"Rate limit reached, waiting {wait_time:.1f} seconds")
-                await asyncio.sleep(wait_time)
-                self._request_count = 0
-                self._last_request_time = current_time
-        else:
-            # Reset for new minute
-            self._request_count = 0
-            self._last_request_time = current_time
-            
-        self._request_count += 1
+        # Update retry configuration
+        self._retry_config = retry.Retry(
+            initial=1.0,
+            maximum=30.0,
+            multiplier=1.5,
+            predicate=retry.if_exception_type(
+                google.api_core.exceptions.ResourceExhausted,
+                google.api_core.exceptions.ServiceUnavailable,
+            )
+        )
 
     async def _ensure_session(self):
         """Ensure API session is initialized"""
@@ -772,7 +770,6 @@ class SliteAgent:
                 5. "Create a new note in a folder":
                    - Use CreateNoteInFolder to create a new note in a specific folder
                    - Specify the folder name, not the ID
-                   - Always provide initial content like "# Title\n\nInitial content for the document"
                    - The folder will be found or created automatically
                 
                 6. "Rename a folder":
@@ -790,10 +787,11 @@ class SliteAgent:
 
                 self.agent_executor = initialize_agent(
                     tools=tools,
-                    llm=ChatOpenAI(
-                        model_name="gpt-4",
+                    llm=ChatGoogleGenerativeAI(
+                        model="models/gemini-1.5-pro",  # Updated model name
+                        google_api_key=self.gemini_api_key,
                         temperature=0,
-                        openai_api_key=self.openai_api_key
+                        convert_system_message_to_human=False
                     ),
                     agent=AgentType.STRUCTURED_CHAT_ZERO_SHOT_REACT_DESCRIPTION,
                     verbose=True,
@@ -807,9 +805,48 @@ class SliteAgent:
             logger.error(f"Error initializing agent: {str(e)}")
             raise
     
-    async def process_query(self, query: str) -> str:
-        """Process a user query and return the response"""
+    async def _check_rate_limit(self):
+        """Dynamic rate limiting"""
         try:
+            current_time = datetime.now()
+            
+            # Calculate dynamic window based on current load
+            window_size = max(1, min(5, self.resource_manager.max_concurrent))
+            max_requests = self.resource_manager.batch_size * window_size
+            
+            if self._request_count >= max_requests:
+                delay = 1 + (self._request_count - max_requests) * 0.5
+                logger.info(f"Rate limit reached. Adjusting delay: {delay}s")
+                await asyncio.sleep(delay)
+                self._request_count = 0
+                await self.resource_manager.adjust_limits(False)
+            else:
+                await self.resource_manager.adjust_limits(True)
+                
+            self._request_count += 1
+            
+        except Exception as e:
+            logger.error(f"Error in rate limiting: {str(e)}")
+            await self.resource_manager.adjust_limits(False)
+
+    @tenacity.retry(
+        retry=tenacity.retry_if_exception_type(
+            (google.api_core.exceptions.ResourceExhausted,
+             google.api_core.exceptions.ServiceUnavailable)
+        ),
+        wait=tenacity.wait_exponential(multiplier=1, min=2, max=30),
+        stop=tenacity.stop_after_attempt(3)
+    )
+    async def process_query(self, query: str) -> str:
+        """Process a user query with dynamic resource management"""
+        try:
+            # Check if memory cleanup is needed
+            now = datetime.now()
+            if now - self._last_memory_cleanup > self._memory_cleanup_interval:
+                await self.clear_memory()
+                self._last_memory_cleanup = now
+
+            # Process query with resource management
             await self._check_rate_limit()
             await self._ensure_session()
             
@@ -817,24 +854,11 @@ class SliteAgent:
                 await self.initialize_agent()
             
             # Check if this is an update operation
-            query_lower = query.lower().strip()
-            if query_lower.startswith("update ") or query_lower.startswith("add content to "):
-                # Extract document title - handle both quoted and unquoted titles
-                title = None
-                if '"' in query:
-                    # Extract title between quotes
-                    try:
-                        title = query.split('"')[1]
-                    except IndexError:
-                        return "Invalid format. Please provide the document title in quotes."
-                else:
-                    # Extract title after "update" or "add content to"
-                    title = query_lower.replace("update ", "").replace("add content to ", "").strip()
+            if query.lower().startswith("update") or query.lower().startswith("add content to"):
+                # Extract document title
+                title = query.split('"')[1] if '"' in query else query.split("update ")[-1].strip()
                 
-                if not title:
-                    return "Please provide a document title to update."
-                
-                # Prompt for multiline content input
+                # Prompt for content
                 print("\nEnter/paste your content (Press Ctrl+D on Unix or Ctrl+Z on Windows + Enter on a new line when done):")
                 content_lines = []
                 while True:
@@ -853,23 +877,18 @@ class SliteAgent:
                 result = await self.tools.update_or_create_note(
                     title=title,
                     content=content,
-                    append=True  # Set to True to append content instead of overwriting
+                    append=False
                 )
                 
-                await self._release_session()
+                await self._release_session()  # Release but don't close session
                 return f"Document update result:\n{result}"
-
-            # Handle other types of queries through normal agent flow
-            response = await self.agent_executor.arun(input=query)
-            await self._release_session()
-            return response
+            else:
+                # Handle other types of queries normally
+                response = await self.agent_executor.arun(input=query)
+                await self._release_session()  # Release but don't close session
+                return response
                 
         except Exception as e:
-            if "429" in str(e):
-                wait_time = random.uniform(2, 5)
-                logger.warning(f"Rate limit hit, waiting {wait_time:.1f} seconds")
-                await asyncio.sleep(wait_time)
-                return await self.process_query(query)
             logger.error(f"Error processing query: {str(e)}")
             logger.error(traceback.format_exc())
             return f"Error processing query: {str(e)}"

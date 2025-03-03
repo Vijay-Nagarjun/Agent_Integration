@@ -21,6 +21,7 @@ from datetime import datetime
 import os
 from cachetools import TTLCache
 import random
+import asyncio
 
 def setup_logging(log_file: str = 'slite_integration.log'):
     """
@@ -50,30 +51,14 @@ note_cache = TTLCache(maxsize=100, ttl=300)  # Cache for 5 minutes
 folder_cache = TTLCache(maxsize=50, ttl=600)  # Cache for 10 minutes
 
 class RateLimiter:
-    """
-    Rate limiter to prevent API throttling.
-    Implements a sliding window rate limiting algorithm.
-    """
+    """Rate limiter to prevent API throttling"""
     
     def __init__(self, max_requests: int = 60, time_window: int = 60):
-        """
-        Initialize rate limiter.
-        
-        Args:
-            max_requests (int): Maximum number of requests allowed in the time window
-            time_window (int): Time window in seconds
-        """
         self.max_requests = max_requests
         self.time_window = time_window
         self.requests = []
 
     def can_make_request(self) -> bool:
-        """
-        Check if a new request can be made within rate limits.
-        
-        Returns:
-            bool: True if request is allowed, False otherwise
-        """
         current_time = time.time()
         # Remove old requests outside the time window
         self.requests = [req_time for req_time in self.requests 
@@ -84,10 +69,9 @@ class RateLimiter:
             return True
         return False
 
-    def wait_for_next_slot(self):
-        """Wait until a request slot becomes available."""
+    async def wait_for_next_slot(self):
         while not self.can_make_request():
-            time.sleep(1)
+            await asyncio.sleep(1)
 
 # Initialize global rate limiter
 rate_limiter = RateLimiter()
